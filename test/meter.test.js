@@ -1,5 +1,5 @@
 import test from 'node:test'; import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'; import os from 'node:os'; import path from 'node:path';
+import { chmod, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'; import os from 'node:os'; import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { latestUsageInFile, scanSessions, snapshotDelta, zeroUsage } from '../lib/usage.js';
 import { atomicWriteJson, hashToken, MeterStore } from '../lib/store.js';
@@ -9,9 +9,9 @@ import { createMeterServer } from '../lib/server.js';
 const fixture = path.join(import.meta.dirname, 'fixtures', 'session.jsonl');
 const usage = (total, input = total) => ({ input_tokens: input, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total });
 async function temp() { return mkdtemp(path.join(os.tmpdir(), 'codex-meter-test-')); }
-async function makeStore({ quota = 100, ttl = 1000, max = 1 } = {}) {
+async function makeStore({ quota = 100, ttl = 1000, max = 1, mode = 'enforce' } = {}) {
   const dir = await temp(); const file = path.join(dir, 'state.json'); let now = 10000; const token = 'meter-user-token';
-  await atomicWriteJson(file, { version: 1, periodStart: now, config: { quotaTokens: quota, resetPeriodMs: 100000, maxConcurrentLeases: max, leaseTtlMs: ttl }, adminTokenHash: hashToken('admin'), users: { alice: { id: 'alice', tokenHash: hashToken(token), enabled: true, used: zeroUsage() } }, leases: {} });
+  await atomicWriteJson(file, { version: 1, periodStart: now, config: { mode, quotaTokens: mode === 'observe' ? null : quota, resetPeriodMs: 100000, maxConcurrentLeases: max, leaseTtlMs: ttl }, adminTokenHash: hashToken('admin'), users: { alice: { id: 'alice', tokenHash: hashToken(token), enabled: true, used: zeroUsage() } }, leases: {} });
   return { store: new MeterStore(file, () => now), token, file, tick: (n) => { now += n; } };
 }
 
@@ -44,6 +44,39 @@ test('quota crossing tells running lease to stop', async () => {
   assert.equal(result.body.stop, true); assert.equal(result.body.reason, 'quota_exhausted');
 });
 
+test('observe-only mode records usage without quota denial or stop', async () => {
+  const { store, token } = await makeStore({ mode: 'observe' }); const id = (await store.start(token)).body.leaseId;
+  const update = await store.update(token, id, usage(1000000));
+  assert.equal(update.body.stop, false); assert.equal(update.body.mode, 'observe'); assert.equal(update.body.quota, null);
+  await store.finish(token, id, usage(1000000));
+  const replacement = await store.start(token); assert.equal(replacement.status, 201); assert.equal(replacement.body.mode, 'observe');
+});
+
+test('legacy state without a mode remains enforcing', async () => {
+  const ctx = await makeStore({ quota: 10 }); const state = JSON.parse(await readFile(ctx.file, 'utf8')); delete state.config.mode; await atomicWriteJson(ctx.file, state);
+  const id = (await ctx.store.start(ctx.token)).body.leaseId; const update = await ctx.store.update(ctx.token, id, usage(10));
+  assert.equal(update.body.stop, true); assert.equal(update.body.mode, 'enforce');
+});
+
+test('admin init creates an observe-only state without a token quota', async () => {
+  const dir = await temp(); const stateFile = path.join(dir, 'state.json'); const admin = path.join(import.meta.dirname, '..', 'bin', 'admin.js');
+  const result = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [admin, 'init', '--users=alice,bob,carol', '--observe-only', '--reset-ms=2592000000'], { env: { ...process.env, CODEX_METER_STATE: stateFile }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = ''; child.stderr.on('data', (x) => { stderr += x; }); child.on('exit', (code) => resolve({ code, stderr }));
+  });
+  assert.equal(result.code, 0, result.stderr); const state = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(state.config.mode, 'observe'); assert.equal(state.config.quotaTokens, null);
+});
+
+test('admin init rejects observe-only combined with a quota', async () => {
+  const dir = await temp(); const stateFile = path.join(dir, 'state.json'); const admin = path.join(import.meta.dirname, '..', 'bin', 'admin.js');
+  const result = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [admin, 'init', '--users=alice,bob,carol', '--observe-only', '--quota=100', '--reset-ms=2592000000'], { env: { ...process.env, CODEX_METER_STATE: stateFile }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = ''; child.stderr.on('data', (x) => { stderr += x; }); child.on('exit', (code) => resolve({ code, stderr }));
+  });
+  assert.equal(result.code, 2); assert.match(result.stderr, /mutually exclusive/);
+});
+
 test('stale lease expires and permits a replacement', async () => {
   const ctx = await makeStore({ ttl: 50 }); const stale = (await ctx.store.start(ctx.token)).body.leaseId; ctx.tick(51);
   assert.equal((await ctx.store.start(ctx.token)).status, 201);
@@ -67,6 +100,16 @@ test('spool replay retains failures then removes successful absolute update', as
 test('command arguments are passed literally without a shell', () => {
   const args = ['--model', 'x & calc.exe', '$(touch /tmp/pwn)', 'quote"value', '%PATH%']; const spec = commandSpec(args, { platform: 'win32', command: 'C:\\safe\\codex.exe' });
   assert.equal(spec.options.shell, false); assert.deepEqual(spec.args, args); assert.equal(spec.command, 'C:\\safe\\codex.exe'); assert.throws(() => commandSpec(['ok\ncalc'], { command: 'codex' }), /invalid/);
+});
+
+test('Unix launcher resolves an installation symlink before locating the app', async () => {
+  const root = await temp(); const link = path.join(root, 'codex-meter'); const launcher = path.join(import.meta.dirname, '..', 'clients', 'unix', 'codex-meter');
+  await symlink(launcher, link);
+  const result = await new Promise((resolve) => {
+    const child = spawn(link, [], { env: { ...process.env, CODEX_METER_HOME: path.join(root, 'missing') }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = ''; child.stderr.on('data', (x) => { stderr += x; }); child.on('exit', (code) => resolve({ code, stderr }));
+  });
+  assert.equal(result.code, 78, result.stderr); assert.match(result.stderr, /Missing\/invalid/); assert.doesNotMatch(result.stderr, /Cannot find module/);
 });
 
 test('state stores only token hashes', async () => {

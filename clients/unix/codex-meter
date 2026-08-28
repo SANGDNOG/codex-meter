@@ -1,2 +1,13 @@
 #!/bin/sh
-exec node "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/bin/codex-meter.js" "$@"
+set -eu
+self=$0
+while [ -L "$self" ]; do
+  dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$dir/$target ;;
+  esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$self")/../.." && pwd)
+exec node "$root/bin/codex-meter.js" "$@"

@@ -8,13 +8,13 @@ Codex Meter is a small, dependency-free quota and usage meter for **exactly thre
 
 It is **not an OpenAI plugin, OAuth proxy, or official billing tool**. It is a cooperative local wrapper plus a central Node.js server.
 
-> 한국어 요약: 세 사람이 각자 본인의 Codex CLI와 계정을 그대로 사용하면서, 중앙 서버에서 사용량을 같은 한도로 관리하는 도구입니다. 프롬프트·응답·소스 코드·Codex 인증정보는 서버로 보내지 않고 숫자 토큰 카운터 5개만 전송합니다.
+> 한국어 요약: 세 사람이 각자 본인의 Codex CLI와 계정을 그대로 사용하면서, 중앙 서버에서 사용량을 집계하고 필요할 때만 같은 한도를 적용하는 도구입니다. 프롬프트·응답·소스 코드·Codex 인증정보는 서버로 보내지 않고 숫자 토큰 카운터 5개만 전송합니다.
 
 ## 한국어 안내
 
 ### 어떤 도구인가요?
 
-Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI를 실행하되, 사용량은 중앙에서 사용자별로 집계하고 같은 쿼터를 적용**하기 위한 도구입니다.
+Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI를 실행하되, 사용량은 중앙에서 사용자별로 집계하고 선택적으로 같은 쿼터를 적용**하기 위한 도구입니다.
 
 실제 구성은 다음 두 부분으로 나뉩니다.
 
@@ -31,9 +31,9 @@ Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI
 
 중앙 Meter 서버
   ├─ 사용자별 누적 사용량
-  ├─ 세 명에게 동일한 쿼터 적용
+  ├─ 관찰 모드 또는 세 명에게 동일한 쿼터 적용
   ├─ 사용자당 동시 실행 1개 제한
-  ├─ 쿼터 초과·비활성 사용자 차단
+  ├─ 강제 모드의 쿼터 초과·모든 모드의 비활성 사용자 차단
   └─ 사용자용 조회 API와 관리자 대시보드
 ```
 
@@ -49,7 +49,7 @@ Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI
 2. 래퍼가 같은 터미널에서 사용자의 로컬 Codex CLI를 실행합니다.
 3. 기본 **5초 간격**으로 로컬 Codex 세션 JSONL을 다시 확인합니다.
 4. 새로 발생한 `token_count`의 다섯 카운터 차이를 자동 계산해 중앙 서버에 전송합니다.
-5. 쿼터 초과 응답을 받으면 실행 중인 Codex를 중지합니다.
+5. 강제 모드에서는 쿼터 초과 응답을 받으면 실행 중인 Codex를 중지합니다. 관찰 모드에서는 사용량만 기록합니다.
 6. Codex가 끝나면 최종 사용량과 실행 종료를 자동 보고합니다.
 7. 일시적인 전송 실패는 로컬 spool에 보관했다가 다음 실행 때 자동 재전송합니다.
 
@@ -87,21 +87,21 @@ node --version
 npm test
 ```
 
-세 명의 사용자와 공통 쿼터를 최초 한 번 초기화합니다.
+세 명의 사용량을 대략 비교하는 목적이라면 **관찰 전용 모드**로 최초 한 번 초기화합니다. 이 모드는 토큰을 기록하지만 임의의 토큰 한도로 Codex를 중지하지 않습니다.
 
 ```sh
 export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
 umask 077
 node bin/admin.js init \
   --users=alice,bob,carol \
-  --quota=1000000 \
+  --observe-only \
   --reset-ms=2592000000 \
   --max-leases=1 \
   --lease-ttl-ms=120000 \
   > meter-tokens-once.json
 ```
 
-예시는 사용자당 토큰 1,000,000개와 30일 초기화 주기를 사용합니다.
+예시는 30일마다 측정 카운터만 초기화합니다. 강제 토큰 정책이 필요할 때만 `--observe-only` 대신 `--quota=원하는_양의_정수`를 사용하세요. 이 값은 OpenAI 플랜 한도가 아니라 운영자가 정하는 로컬 정책입니다.
 
 `meter-tokens-once.json`에는 관리자 토큰 1개와 사용자 토큰 3개가 **최초 한 번만 평문으로 출력**됩니다. 각 사용자에게 본인의 토큰만 안전한 방법으로 전달한 뒤 파일을 안전하게 삭제하세요. 토큰을 잃어버리면 해시에서 복구할 수 없으므로 새 상태를 초기화해야 합니다.
 
@@ -139,6 +139,8 @@ cat > "$HOME/.codex-meter/client.json" <<'JSON'
 JSON
 chmod 600 "$HOME/.codex-meter/client.json"
 chmod +x clients/unix/codex-meter
+mkdir -p "$HOME/.local/bin"
+ln -s "$(pwd)/clients/unix/codex-meter" "$HOME/.local/bin/codex-meter"
 ```
 
 이제 원래 `codex`를 실행하던 자리에 래퍼를 사용합니다.
@@ -146,6 +148,7 @@ chmod +x clients/unix/codex-meter
 ```sh
 /path/to/codex-meter/clients/unix/codex-meter
 /path/to/codex-meter/clients/unix/codex-meter --model MODEL_NAME "작업 내용"
+codex-meter
 ```
 
 ### 3. Windows PowerShell 사용자 설정
@@ -228,10 +231,10 @@ Each user's computer                         Central meter server
 ```
 
 - Requires **exactly three unique meter users**.
-- Applies one configurable quota and reset period equally to all three users.
+- Supports observe-only measurement or one configurable quota applied equally to all three users; both modes use the same reset period.
 - Allows one active wrapper per user.
-- Denies a new run when the user is disabled, already active, or out of quota.
-- Stops a connected run after its measured usage crosses the quota.
+- Denies a new run when the user is disabled or already active; enforcement mode also denies users who are out of quota.
+- In enforcement mode, stops a connected run after its measured usage crosses the quota.
 - Expires stale leases after a crashed or disconnected client.
 - Spools numeric updates during transient network failures and replays them idempotently.
 - Gives each user an authenticated own-usage endpoint and gives the administrator aggregate JSON/HTML views.
@@ -275,21 +278,21 @@ node --version
 npm test
 ```
 
-Initialize the state once. Exactly three unique user IDs are mandatory:
+For rough relative measurement, initialize the state once in **observe-only mode**. This records tokens but never stops Codex at an arbitrary token threshold. Exactly three unique user IDs are mandatory:
 
 ```sh
 export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
 umask 077
 node bin/admin.js init \
   --users=alice,bob,carol \
-  --quota=1000000 \
+  --observe-only \
   --reset-ms=2592000000 \
   --max-leases=1 \
   --lease-ttl-ms=120000 \
   > meter-tokens-once.json
 ```
 
-The example uses a 1,000,000-token quota and a 30-day reset period. Choose values that match your policy.
+The example resets only the measurement counters every 30 days. If you intentionally want local enforcement, replace `--observe-only` with `--quota=YOUR_POSITIVE_INTEGER`. That value is an operator-defined local policy, not an OpenAI plan limit.
 
 `meter-tokens-once.json` contains the admin token and three user tokens in plaintext **only once**. Give each person only their own token through a secure channel, then securely remove the file. If you lose the tokens, initialize a new state instead of trying to recover them from the hash-only state file.
 
@@ -331,6 +334,8 @@ cat > "$HOME/.codex-meter/client.json" <<'JSON'
 JSON
 chmod 600 "$HOME/.codex-meter/client.json"
 chmod +x clients/unix/codex-meter
+mkdir -p "$HOME/.local/bin"
+ln -s "$(pwd)/clients/unix/codex-meter" "$HOME/.local/bin/codex-meter"
 ```
 
 Use the wrapper anywhere you would normally use `codex`:
@@ -338,6 +343,7 @@ Use the wrapper anywhere you would normally use `codex`:
 ```sh
 /path/to/codex-meter/clients/unix/codex-meter
 /path/to/codex-meter/clients/unix/codex-meter --model MODEL_NAME "your prompt"
+codex-meter
 ```
 
 Optional shell alias:
