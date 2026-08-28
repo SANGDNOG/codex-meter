@@ -5,6 +5,7 @@ import { latestUsageInFile, scanSessions, snapshotDelta, zeroUsage } from '../li
 import { atomicWriteJson, hashToken, MeterStore } from '../lib/store.js';
 import { acquireClientLock, isPermanentMeterError, replaySpool, spoolUpdate } from '../lib/client.js'; import { commandSpec } from '../lib/command.js';
 import { createMeterServer } from '../lib/server.js';
+import { uiScript } from '../lib/ui.js';
 
 const fixture = path.join(import.meta.dirname, 'fixtures', 'session.jsonl');
 const usage = (total, input = total) => ({ input_tokens: input, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total });
@@ -138,16 +139,37 @@ test('finish deactivates atomically before a queued replacement start', async ()
   assert.equal(finished.status, 200); assert.equal(replacement.status, 201);
 });
 
-test('HTTP health, own usage, and admin endpoints enforce authentication', async (t) => {
+test('generated browser UI script is syntactically valid', () => {
+  assert.doesNotThrow(() => new Function(uiScript));
+});
+
+test('browser UI disables credential entry on insecure HTTP origins', () => {
+  const makeElement = () => ({ disabled: false, firstChild: null, textContent: '', classList: { add() {}, remove() {} }, addEventListener() {}, appendChild() {} });
+  const elements = Object.fromEntries(['usage-token', 'admin-token', 'usage-result', 'admin-result'].map((id) => [id, makeElement()]));
+  for (const id of ['usage-form', 'admin-form']) { const button = makeElement(); const form = makeElement(); form.querySelector = () => button; form.button = button; elements[id] = form; }
+  const document = { getElementById: (id) => elements[id], createElement: () => makeElement() };
+  assert.doesNotThrow(() => new Function('document', 'location', 'fetch', uiScript)(document, { protocol: 'http:' }, () => { throw new Error('fetch must not run'); }));
+  assert.equal(elements['usage-token'].disabled, true); assert.equal(elements['admin-token'].disabled, true);
+  assert.equal(elements['usage-form'].button.disabled, true); assert.equal(elements['admin-form'].button.disabled, true);
+  assert.match(elements['usage-result'].textContent, /HTTPS/); assert.match(elements['admin-result'].textContent, /HTTPS/);
+});
+
+test('HTTP landing UI is public while usage and admin data enforce authentication', async (t) => {
   const { file, token } = await makeStore(); const server = createMeterServer({ stateFile: file });
   await new Promise((resolve, reject) => server.listen(0, '127.0.0.1', (e) => e ? reject(e) : resolve()));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const base = `http://127.0.0.1:${server.address().port}`;
   assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ok: true });
+  const landing = await fetch(`${base}/`); const html = await landing.text();
+  assert.equal(landing.status, 200); assert.match(landing.headers.get('content-type'), /^text\/html/); assert.match(landing.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.match(html, /id="usage-form"/); assert.match(html, /id="admin-form"/); assert.doesNotMatch(html, /meter-user-token|Bearer admin/);
+  const script = await fetch(`${base}/ui.js`); const javascript = await script.text();
+  assert.equal(script.status, 200); assert.match(script.headers.get('content-type'), /^text\/javascript/); assert.match(javascript, /authorization:'Bearer '/); assert.doesNotMatch(javascript, /localStorage|sessionStorage|document\.cookie/);
+  const adminPage = await fetch(`${base}/admin`); assert.equal(adminPage.status, 200); assert.match(await adminPage.text(), /관리자 대시보드/);
   assert.equal((await fetch(`${base}/v1/usage`)).status, 401);
   assert.equal((await fetch(`${base}/v1/usage`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+  assert.equal((await fetch(`${base}/admin.json`)).status, 401);
   assert.equal((await fetch(`${base}/admin.json`, { headers: { authorization: 'Bearer admin' } })).status, 200);
-  const page = await fetch(`${base}/admin`, { headers: { authorization: 'Bearer admin' } }); assert.equal(page.status, 200); assert.match(await page.text(), /<table>/);
 });
 
 test('HTTP usage endpoint rejects content, unknown fields, missing counters, and bad numbers without mutation', async (t) => {

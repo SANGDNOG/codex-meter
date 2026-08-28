@@ -177,21 +177,18 @@ PowerShell 래퍼와 Node.js 래퍼는 인수를 배열로 전달하며 `cmd.exe
 
 ### 4. 사용량 확인과 사용자 관리
 
-사용자는 자신의 Meter 토큰으로 본인 사용량만 조회할 수 있습니다.
+브라우저에서 서버 루트 주소를 열고 자신의 Meter 토큰을 입력하면 본인 사용량만 조회할 수 있습니다. 이 토큰은 OpenAI API 키가 아니라 서버 초기화 때 별도로 발급되는 Meter 전용 자격 증명이며, 웹 화면은 토큰을 URL·쿠키·브라우저 저장소에 보관하지 않습니다.
 
 ```sh
 curl --oauth2-bearer USER_METER_TOKEN \
   https://meter.example.internal/v1/usage
 ```
 
-관리자는 전체 사용량 JSON이나 HTML 대시보드를 조회할 수 있습니다.
+관리자는 같은 루트 화면의 관리자 로그인에 Admin Meter 토큰을 입력해 전체 대시보드를 조회하거나, 인증된 JSON API를 사용할 수 있습니다.
 
 ```sh
 curl --oauth2-bearer ADMIN_METER_TOKEN \
   https://meter.example.internal/admin.json
-
-curl --oauth2-bearer ADMIN_METER_TOKEN \
-  https://meter.example.internal/admin
 ```
 
 사용자를 비활성화하거나 다시 활성화할 때는 경쟁 상태를 피하기 위해 먼저 서버를 중지한 뒤 실행합니다.
@@ -399,21 +396,18 @@ The wrapper forwards arguments as an array and never invokes `cmd.exe`. It prefe
 
 ## Usage and administration
 
-A user can see only their own usage:
+A user can open the server root URL and enter their Meter token to see only their own usage. This is a meter-specific credential issued during server initialization, not an OpenAI API key. The page does not store it in a URL, cookie, local storage, or session storage. The authenticated JSON API remains available:
 
 ```sh
 curl --oauth2-bearer USER_METER_TOKEN \
   https://meter.example.internal/v1/usage
 ```
 
-The administrator can read aggregate JSON or the small HTML dashboard:
+The administrator enters the Admin Meter token in the root page to open the aggregate dashboard, or reads the authenticated JSON API:
 
 ```sh
 curl --oauth2-bearer ADMIN_METER_TOKEN \
   https://meter.example.internal/admin.json
-
-curl --oauth2-bearer ADMIN_METER_TOKEN \
-  https://meter.example.internal/admin
 ```
 
 To disable or re-enable a user, stop the server first so there are no competing state writers:
