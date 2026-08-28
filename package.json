@@ -1,0 +1,25 @@
+{
+  "name": "codex-meter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Privacy-preserving quota and usage meter for three local Codex CLI users",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SANGDNOG/codex-meter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SANGDNOG/codex-meter/issues"
+  },
+  "homepage": "https://github.com/SANGDNOG/codex-meter#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "server": "node bin/server.js",
+    "admin": "node bin/admin.js",
+    "codex-meter": "node bin/codex-meter.js",
+    "test": "node --test --test-concurrency=1"
+  }
+}

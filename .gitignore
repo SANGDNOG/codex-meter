@@ -1,0 +1,30 @@
+# Dependencies and logs
+node_modules/
+npm-debug.log*
+
+# Server state and one-time plaintext credential output
+.codex-meter-server/
+state.json
+state.json.*
+meter-tokens-once.json
+
+# Client credentials, lock, and offline spool
+.codex-meter/
+client.json
+client.lock
+spool/
+
+# Codex authentication/session data must never enter this repository
+.codex/
+auth.json
+sessions/
+
+# Local/editor/OS files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+coverage/
