@@ -8,7 +8,201 @@ Codex Meter is a small, dependency-free quota and usage meter for **exactly thre
 
 It is **not an OpenAI plugin, OAuth proxy, or official billing tool**. It is a cooperative local wrapper plus a central Node.js server.
 
-> 한국어 요약: 세 사람이 각자 본인의 Codex CLI와 계정을 그대로 사용하면서, 중앙 서버에서 사용량을 같은 한도로 관리하는 도구입니다. 프롬프트·응답·소스 코드·Codex 인증정보는 서버로 보내지 않고 숫자 토큰 카운터 5개만 전송합니다. 자세한 설치 순서는 아래 명령을 그대로 따르면 됩니다.
+> 한국어 요약: 세 사람이 각자 본인의 Codex CLI와 계정을 그대로 사용하면서, 중앙 서버에서 사용량을 같은 한도로 관리하는 도구입니다. 프롬프트·응답·소스 코드·Codex 인증정보는 서버로 보내지 않고 숫자 토큰 카운터 5개만 전송합니다.
+
+## 한국어 안내
+
+### 어떤 도구인가요?
+
+Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI를 실행하되, 사용량은 중앙에서 사용자별로 집계하고 같은 쿼터를 적용**하기 위한 도구입니다.
+
+실제 구성은 다음 두 부분으로 나뉩니다.
+
+1. **개인 컴퓨터의 래퍼**가 Codex CLI를 대신 실행합니다.
+2. **중앙 Meter 서버**가 세 사용자의 사용량, 쿼터, 실행 상태를 관리합니다.
+
+```text
+사용자 A/B/C의 개인 터미널
+  └─ Codex Meter 래퍼
+       ├─ 중앙 서버에 실행 허가 요청
+       ├─ 본인 컴퓨터의 Codex CLI 실행
+       ├─ 로컬 세션에서 token_count만 집계
+       └─ 숫자 사용량 5개만 중앙 서버에 보고
+
+중앙 Meter 서버
+  ├─ 사용자별 누적 사용량
+  ├─ 세 명에게 동일한 쿼터 적용
+  ├─ 사용자당 동시 실행 1개 제한
+  ├─ 쿼터 초과·비활성 사용자 차단
+  └─ 사용자용 조회 API와 관리자 대시보드
+```
+
+이 프로젝트는 **OpenAI 공식 플러그인이나 공식 사용량·과금 도구가 아닙니다.** Codex 앞에서 실행되는 협력형 로컬 래퍼와 별도의 중앙 관리 서버입니다.
+
+### 개인정보와 인증정보
+
+각 사용자는 자신의 컴퓨터에 Codex CLI를 설치하고 직접 인증합니다. Codex Meter는 다음 정보를 읽거나 서버로 보내지 않습니다.
+
+- Codex OAuth 토큰과 `auth.json`
+- 프롬프트와 응답
+- 도구 실행 내용
+- 소스 코드와 파일 내용
+- 일반 세션 이벤트
+
+래퍼는 로컬 Codex 세션 JSONL을 한 줄씩 읽어 `token_count` 이벤트만 찾은 뒤 다음 숫자 5개만 전송합니다.
+
+- `input_tokens`
+- `cached_input_tokens`
+- `output_tokens`
+- `reasoning_output_tokens`
+- `total_tokens`
+
+Meter 서버용 사용자 토큰은 Codex 인증정보와 완전히 별개입니다. 서버 상태에는 평문 토큰 대신 SHA-256 해시만 저장됩니다.
+
+### 필요한 환경
+
+- 중앙 서버와 각 사용자 컴퓨터에 **Node.js 22 이상**
+- 각 사용자 컴퓨터에 공식 Codex CLI 설치 및 로컬 인증
+- 원격 연결 시 HTTPS 리버스 프록시, VPN 또는 SSH 터널
+- 정확히 세 개의 고유한 Meter 사용자 ID
+
+외부 런타임 패키지가 없으므로 `npm install`은 필요하지 않습니다.
+
+### 1. 중앙 서버 설치
+
+```sh
+git clone https://github.com/SANGDNOG/codex-meter.git
+cd codex-meter
+node --version
+npm test
+```
+
+세 명의 사용자와 공통 쿼터를 최초 한 번 초기화합니다.
+
+```sh
+export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
+umask 077
+node bin/admin.js init \
+  --users=alice,bob,carol \
+  --quota=1000000 \
+  --reset-ms=2592000000 \
+  --max-leases=1 \
+  --lease-ttl-ms=120000 \
+  > meter-tokens-once.json
+```
+
+예시는 사용자당 토큰 1,000,000개와 30일 초기화 주기를 사용합니다.
+
+`meter-tokens-once.json`에는 관리자 토큰 1개와 사용자 토큰 3개가 **최초 한 번만 평문으로 출력**됩니다. 각 사용자에게 본인의 토큰만 안전한 방법으로 전달한 뒤 파일을 안전하게 삭제하세요. 토큰을 잃어버리면 해시에서 복구할 수 없으므로 새 상태를 초기화해야 합니다.
+
+서버를 로컬 주소에서 실행합니다.
+
+```sh
+CODEX_METER_HOST=127.0.0.1 \
+CODEX_METER_PORT=8787 \
+node bin/server.js
+```
+
+상태 확인:
+
+```sh
+curl http://127.0.0.1:8787/health
+```
+
+평문 HTTP 서버를 신뢰할 수 없는 네트워크에 직접 공개하지 마세요. 원격 사용자는 HTTPS, VPN 또는 SSH 터널을 통해 접속해야 합니다.
+
+### 2. macOS·Linux 사용자 설정
+
+각 사용자 컴퓨터에서 저장소를 받고 개인 설정 파일을 만듭니다.
+
+```sh
+git clone https://github.com/SANGDNOG/codex-meter.git
+cd codex-meter
+mkdir -p "$HOME/.codex-meter"
+chmod 700 "$HOME/.codex-meter"
+cat > "$HOME/.codex-meter/client.json" <<'JSON'
+{
+  "serverUrl": "https://meter.example.internal/",
+  "meterToken": "본인에게_발급된_METER_TOKEN",
+  "pollIntervalMs": 5000
+}
+JSON
+chmod 600 "$HOME/.codex-meter/client.json"
+chmod +x clients/unix/codex-meter
+```
+
+이제 원래 `codex`를 실행하던 자리에 래퍼를 사용합니다.
+
+```sh
+/path/to/codex-meter/clients/unix/codex-meter
+/path/to/codex-meter/clients/unix/codex-meter --model MODEL_NAME "작업 내용"
+```
+
+### 3. Windows PowerShell 사용자 설정
+
+```powershell
+git clone https://github.com/SANGDNOG/codex-meter.git
+cd codex-meter
+New-Item -ItemType Directory -Force "$HOME\.codex-meter" | Out-Null
+@'
+{
+  "serverUrl": "https://meter.example.internal/",
+  "meterToken": "본인에게_발급된_METER_TOKEN",
+  "pollIntervalMs": 5000
+}
+'@ | Set-Content -Encoding utf8 "$HOME\.codex-meter\client.json"
+```
+
+PowerShell 래퍼로 Codex를 실행합니다.
+
+```powershell
+powershell -NoProfile -File .\clients\windows\codex-meter.ps1
+powershell -NoProfile -File .\clients\windows\codex-meter.ps1 --model MODEL_NAME "작업 내용"
+```
+
+PowerShell 래퍼와 Node.js 래퍼는 인수를 배열로 전달하며 `cmd.exe`를 호출하지 않습니다.
+
+### 4. 사용량 확인과 사용자 관리
+
+사용자는 자신의 Meter 토큰으로 본인 사용량만 조회할 수 있습니다.
+
+```sh
+curl --oauth2-bearer USER_METER_TOKEN \
+  https://meter.example.internal/v1/usage
+```
+
+관리자는 전체 사용량 JSON이나 HTML 대시보드를 조회할 수 있습니다.
+
+```sh
+curl --oauth2-bearer ADMIN_METER_TOKEN \
+  https://meter.example.internal/admin.json
+
+curl --oauth2-bearer ADMIN_METER_TOKEN \
+  https://meter.example.internal/admin
+```
+
+사용자를 비활성화하거나 다시 활성화할 때는 경쟁 상태를 피하기 위해 먼저 서버를 중지한 뒤 실행합니다.
+
+```sh
+export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
+node bin/admin.js set-enabled alice false
+node bin/admin.js set-enabled alice true
+```
+
+### 네트워크 장애와 제한 사항
+
+- 실행 전 중앙 서버에 연결할 수 없으면 Codex 실행을 시작하지 않습니다.
+- 정상적으로 시작한 뒤 일시적인 네트워크 장애가 발생하면 로컬 Codex는 계속 실행됩니다.
+- 전송하지 못한 숫자 사용량은 개인 컴퓨터의 비공개 spool 파일에 저장했다가 다음 실행 때 다시 전송합니다.
+- 온라인 상태에서도 파일 확인 주기만큼 쿼터를 조금 초과할 수 있습니다.
+- 서버나 네트워크가 끊긴 동안에는 중앙 차단을 적용할 수 없어 초과량이 커질 수 있습니다.
+- 사용자가 원본 `codex`를 직접 실행하거나 로컬 프로그램을 수정하면 계량을 우회할 수 있습니다. 따라서 이 도구는 세 사용자가 래퍼 사용에 동의하는 **협력형 계량 방식**입니다.
+- Codex 세션 삭제·손상, 갑작스러운 전원 차단, 향후 세션 형식 변경은 측정 정확도를 낮출 수 있습니다.
+- 표시되는 사용량은 OpenAI의 공식 Pro/Codex 잔여량이나 청구 사용량이 아닙니다.
+
+---
+
+## English documentation
 
 ## What it does
 
