@@ -27,7 +27,7 @@ Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI
        ├─ 중앙 서버에 실행 허가 요청
        ├─ 본인 컴퓨터의 Codex CLI 실행
        ├─ 로컬 세션에서 token_count만 집계
-       └─ 숫자 사용량 5개만 중앙 서버에 보고
+       └─ 세션에서 추출한 숫자 사용량 5개만 중앙 서버에 보고
 
 중앙 Meter 서버
   ├─ 사용자별 누적 사용량
@@ -41,15 +41,9 @@ Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI
 
 ### 개인정보와 인증정보
 
-각 사용자는 자신의 컴퓨터에 Codex CLI를 설치하고 직접 인증합니다. Codex Meter는 다음 정보를 읽거나 서버로 보내지 않습니다.
+각 사용자는 자신의 컴퓨터에 Codex CLI를 설치하고 직접 인증합니다. Codex Meter는 Codex OAuth 토큰과 `auth.json`을 읽거나 복사하거나 서버로 보내지 않습니다.
 
-- Codex OAuth 토큰과 `auth.json`
-- 프롬프트와 응답
-- 도구 실행 내용
-- 소스 코드와 파일 내용
-- 일반 세션 이벤트
-
-래퍼는 로컬 Codex 세션 JSONL을 한 줄씩 읽어 `token_count` 이벤트만 찾은 뒤 다음 숫자 5개만 전송합니다.
+래퍼는 로컬 Codex 세션 JSONL을 한 줄씩 읽고 각 레코드를 파싱해 `token_count` 이벤트인지 확인합니다. 프롬프트·응답·도구 실행·소스 내용 등 `token_count`가 아닌 레코드는 로컬에서 즉시 버리며, 저장하거나 중앙 서버로 전송하지 않습니다. 세션에서 추출해 전송하는 사용량 정보는 다음 숫자 5개뿐입니다.
 
 - `input_tokens`
 - `cached_input_tokens`
@@ -160,7 +154,7 @@ powershell -NoProfile -File .\clients\windows\codex-meter.ps1
 powershell -NoProfile -File .\clients\windows\codex-meter.ps1 --model MODEL_NAME "작업 내용"
 ```
 
-PowerShell 래퍼와 Node.js 래퍼는 인수를 배열로 전달하며 `cmd.exe`를 호출하지 않습니다.
+PowerShell 래퍼와 Node.js 래퍼는 인수를 배열로 전달하며 `cmd.exe`를 호출하지 않습니다. 기본적으로 네이티브 `codex.exe`를 우선 사용합니다. 표준 npm 설치의 `codex.cmd`만 있으면 인접한 공식 `@openai/codex/bin/codex.js`를 Node.js로 직접 실행합니다. 설치 위치가 특수하면 `CODEX_METER_CODEX`에 `.cmd`가 아닌 네이티브 `codex.exe` 전체 경로를 지정하세요.
 
 ### 4. 사용량 확인과 사용자 관리
 
@@ -194,6 +188,7 @@ node bin/admin.js set-enabled alice true
 - 실행 전 중앙 서버에 연결할 수 없으면 Codex 실행을 시작하지 않습니다.
 - 정상적으로 시작한 뒤 일시적인 네트워크 장애가 발생하면 로컬 Codex는 계속 실행됩니다.
 - 전송하지 못한 숫자 사용량은 개인 컴퓨터의 비공개 spool 파일에 저장했다가 다음 실행 때 다시 전송합니다.
+- 인증 실패나 잘못된 요청 같은 영구적인 HTTP 4xx 오류가 발생하면 래퍼가 Codex 실행을 중지합니다.
 - 온라인 상태에서도 파일 확인 주기만큼 쿼터를 조금 초과할 수 있습니다.
 - 서버나 네트워크가 끊긴 동안에는 중앙 차단을 적용할 수 없어 초과량이 커질 수 있습니다.
 - 사용자가 원본 `codex`를 직접 실행하거나 로컬 프로그램을 수정하면 계량을 우회할 수 있습니다. 따라서 이 도구는 세 사용자가 래퍼 사용에 동의하는 **협력형 계량 방식**입니다.
