@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"dimensions-a","model":"gpt-test","reasoning_effort":"high","service_tier":"fast"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":10,"output_tokens":30,"reasoning_output_tokens":12,"total_tokens":130},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":10,"output_tokens":30,"reasoning_output_tokens":12,"total_tokens":130}}}}

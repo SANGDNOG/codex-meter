@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"id":"resume-a","source":"resume"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"total_tokens":300}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"total_tokens":500}}}}

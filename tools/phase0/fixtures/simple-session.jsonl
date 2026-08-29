@@ -1,0 +1,4 @@
+{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"simple-a","source":"cli"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"total_tokens":100},"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"total_tokens":150},"total_token_usage":{"input_tokens":250,"total_tokens":250}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"total_tokens":150},"total_token_usage":{"input_tokens":400,"total_tokens":400}}}}

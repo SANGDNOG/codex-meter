@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"unknown-child","source":"subagent"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"total_tokens":200}}}}

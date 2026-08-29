@@ -28,3 +28,6 @@ Thumbs.db
 .vscode/
 .idea/
 coverage/
+
+# Real Phase 0 probe and calibration observations
+phase0-output/

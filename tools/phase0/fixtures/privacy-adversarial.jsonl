@@ -1,0 +1,5 @@
+{"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","cwd":"/home/alice/SECRET/project","payload":{"type":"user_message","message":"SECRET_PROMPT_CONTENT","authorization":"Bearer SECRET","tool_input":{"path":"/private/source.js"}}}
+{"type":"response_item","payload":{"type":"assistant_message","text":"SECRET_RESPONSE_CONTENT","tool_output":"SECRET_TOOL_OUTPUT","environment":{"API_KEY":"SECRET_KEY"}}}
+{"type":"response_item","payload":{"type":"function_call","params":{"model":"SECRET_MODEL_CONTENT","parent_id":"SECRET_PARENT_CONTENT"}}}
+{"type":"session_meta","payload":{"id":"privacy-a","cwd":"/very/private/path","source":"cli","model":"gpt-test"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":6}},"content":"SECRET_TOKEN_EVENT_CONTENT"}}
