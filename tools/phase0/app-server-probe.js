@@ -13,7 +13,12 @@ export async function runAppServerProbe({ now = new Date().toISOString(), comman
       ['rateLimits', 'account/rateLimits/read', null, normalizeRateLimits, 'rateLimits'],
       ['accountUsage', 'account/usage/read', null, normalizeAccountUsage, 'accountUsage']
     ]) {
-      try { const raw = await client.request(item[1], item[2]); result.capabilities[item[0]] = true; result[item[4]] = item[3](raw); }
+      try {
+        const raw = await client.request(item[1], item[2]); const normalized = item[3](raw);
+        if (normalized == null) { result.errors.push({ method: item[1], code: null, kind: 'malformed_response', message: 'malformed_response' }); continue; }
+        result.capabilities[item[0]] = true; result[item[4]] = normalized;
+        if (item[0] === 'accountUsage') result.capabilities.threadUsage = normalized.threadUsage.available;
+      }
       catch (error) { result.errors.push({ method: item[1], ...classifyError(error) }); }
     }
   } catch (error) { result.errors.push({ method: 'initialize', ...classifyError(error) }); }

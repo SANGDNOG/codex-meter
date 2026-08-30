@@ -22,6 +22,10 @@ export function cleanTokens(value) {
   const out = Object.fromEntries(TOKEN_FIELDS.map((key) => [key, null]));
   if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
   for (const key of TOKEN_FIELDS) if (Number.isSafeInteger(value[key]) && value[key] >= 0) out[key] = value[key];
+  // Upstream uses Option<serde_json::Number>. It is provider workload, not a token counter,
+  // and is deliberately excluded from TOKEN_FIELDS and all token arithmetic below.
+  const budget = value.codex_rollout_budget_units;
+  if (typeof budget === 'number' && Number.isFinite(budget) && budget >= 0) out.codex_rollout_budget_units = budget;
   return out;
 }
 export function addTokens(a, b) {
