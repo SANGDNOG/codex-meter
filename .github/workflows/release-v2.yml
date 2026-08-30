@@ -1,0 +1,88 @@
+name: Release V2 Agent
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v2-agent-*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+            artifact: codex-meter-agent-linux-x64
+          - target: windows-x64
+            runner: windows-2025
+            artifact: codex-meter-agent-windows-x64.exe
+          # xlarge is GitHub's native Apple-silicon runner, not an x64 cross-build.
+          - target: macos-arm64
+            runner: macos-14-xlarge
+            artifact: codex-meter-agent-macos-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - name: Build and inject native SEA
+        shell: bash
+        env:
+          CODEX_METER_RELEASE_TARGET: ${{ matrix.target }}
+          CODEX_METER_RELEASE_OUT: dist/release-v2
+        run: npm run package:v2-agent
+      - name: Smoke test SEA without invoking node or npm
+        shell: bash
+        env:
+          ARTIFACT: dist/release-v2/${{ matrix.artifact }}
+        run: |
+          "$ARTIFACT" --version
+          tmp="$(mktemp -d)"
+          chmod 700 "$tmp"
+          printf '%s\n' '{"serverUrl":"http://127.0.0.1:9","deviceId":"smoke","deviceSecret":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","codexHome":"'"$tmp"'/codex","databasePath":"'"$tmp"'/agent.db","allowHttpForTests":true}' > "$tmp/agent.json"
+          chmod 600 "$tmp/agent.json"
+          "$ARTIFACT" status --config "$tmp/agent.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/release-v2/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24.15.0 }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: agent-*
+          path: dist/release-v2
+          merge-multiple: true
+      - run: node scripts/release-v2-manifest.js dist/release-v2
+      - name: Verify checksums and manifest deterministically
+        run: |
+          sha256sum --check dist/release-v2/SHA256SUMS
+          cp dist/release-v2/manifest.json /tmp/manifest.json
+          node scripts/release-v2-manifest.js dist/release-v2
+          diff -u /tmp/manifest.json dist/release-v2/manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-meter-agent-v2-release
+          path: dist/release-v2/*
+      - name: Publish tagged release assets
+        if: startsWith(github.ref, 'refs/tags/v2-agent-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release-v2/*

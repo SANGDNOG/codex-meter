@@ -1,0 +1,13 @@
+[Unit]
+Description=Codex Meter Agent
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart="@@EXECUTABLE@@" run --config "@@CONFIG@@"
+Restart=on-failure
+RestartSec=5
+Environment="CODEX_METER_EXECUTABLE=@@EXECUTABLE@@"
+
+[Install]
+WantedBy=default.target

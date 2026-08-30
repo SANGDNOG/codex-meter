@@ -1,0 +1,18 @@
+services:
+  codex-meter:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    image: codex-meter:v2
+    restart: unless-stopped
+    environment:
+      CODEX_METER_ADMIN_PASSWORD: ${CODEX_METER_ADMIN_PASSWORD:?set a strong administrator password}
+      CODEX_METER_SERVER_URL: ${CODEX_METER_SERVER_URL:-http://localhost:3000}
+      CODEX_METER_TRUSTED_PROXIES: ${CODEX_METER_TRUSTED_PROXIES:-127.0.0.1,::1}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - codex-meter-data:/data
+
+volumes:
+  codex-meter-data:

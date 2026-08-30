@@ -1,5 +1,40 @@
 # Codex Meter
 
+## V2 (recommended)
+
+V2 is the recommended architecture: one persistent per-user Agent on each monitored computer and one Node.js 24.15+ Server providing both the Dashboard and versioned API. Devices operate concurrently; there is no lease and no invented token quota. The Agent counts newly observed `token_count.lastUsage` events from installation onward and delivers a privacy-allowlisted numeric event through a crash-safe SQLite outbox.
+
+**Status:** the V2 MVP implementation, migrations, Dashboard, installers, Docker deployment, and release automation are present. Before a production rollout, run the [two-real-machine validation](docs/v2-validation.md) in your own Codex environment.
+
+### Fast server start (Docker)
+
+```sh
+cp compose.v2.example.yml compose.yml
+export CODEX_METER_ADMIN_PASSWORD='replace-with-a-long-random-password'
+export CODEX_METER_SERVER_URL='https://meter.example.com'
+export CODEX_METER_TRUSTED_PROXIES='127.0.0.1,::1' # exact reverse-proxy backend source IP(s)
+docker compose up -d --build
+curl http://127.0.0.1:3000/api/v1/health
+```
+
+Put an HTTPS reverse proxy in front of the loopback-bound port. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and list the proxy's exact backend source IP in `CODEX_METER_TRUSTED_PROXIES` (Docker bridge/NAT deployments may not appear as loopback). Plaintext enrollment and Agent sync are rejected with HTTP 426. The single service stores its WAL-mode SQLite database at `/data/meter.db`; back up that file using a SQLite-safe backup or a stopped-container copy. Open the Dashboard, create Groups, choose **Add Device**, and run the displayed one-line installer. Released Agents for Linux x64, Windows x64, and macOS arm64 are self-contained and require no global Node.js or npm on monitored computers.
+
+### V2 semantics and caveats
+
+- Account quota reporting is **read-only, optional, and may be stale or unavailable**. It is never estimated from token counts.
+- Group percentage is the **share of locally measured token usage**, not exact OpenAI quota attribution or billing.
+- Never upload Codex rollout JSONL or `auth.json`, including in support requests.
+- Recognized inherited fork/subagent/revert history is skipped. Ambiguous inherited files are baselined, so they **undercount safely** rather than risk double-counting.
+- SQLite is a **single-service MVP**. Do not run multiple Server replicas against `/data/meter.db`; no Redis, PostgreSQL, or queue is required.
+
+V2 documentation: [architecture](docs/v2-architecture.md), [installation](docs/v2-installation.md), [deployment](docs/v2-deployment.md), [validation](docs/v2-validation.md), [privacy](docs/v2-privacy.md), and [troubleshooting](docs/v2-troubleshooting.md).
+
+---
+
+## V1 legacy wrapper documentation
+
+Everything below describes V1. V1 remains tested for compatibility but is legacy: it requires launching Codex through a wrapper, assumes exactly three users, and uses leases/operator-defined quota behavior that V2 deliberately does not use.
+
 [![Node.js 22](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![Tests](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml/badge.svg)](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

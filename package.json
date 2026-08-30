@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Privacy-preserving quota and usage meter for three local Codex CLI users",
+  "description": "Privacy-preserving multi-device Codex usage meter with a legacy V1 mode",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,12 +14,23 @@
   },
   "homepage": "https://github.com/SANGDNOG/codex-meter#readme",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.15"
   },
   "scripts": {
     "server": "node bin/server.js",
     "admin": "node bin/admin.js",
     "codex-meter": "node bin/codex-meter.js",
-    "test": "node --test --test-concurrency=1"
+    "v2-agent": "node bin/v2-agent.js",
+    "v2-server": "node bin/v2-server.js",
+    "test": "node --test --test-concurrency=1",
+    "test:v1": "node --test --test-concurrency=1 test/meter.test.js test/phase0.test.js test/phase0-app-update.test.js test/phase0-rollout-update.test.js",
+    "test:v2": "node --test --test-concurrency=1 test/v2-*.test.js",
+    "check:syntax": "node scripts/check-syntax.js",
+    "package:v2-agent": "node scripts/package-v2-agent.js",
+    "release:v2-manifest": "node scripts/release-v2-manifest.js"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9",
+    "postject": "1.0.0-alpha.6"
   }
 }

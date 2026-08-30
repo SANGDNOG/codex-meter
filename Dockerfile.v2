@@ -1,0 +1,12 @@
+FROM node:24.15.0-bookworm-slim
+WORKDIR /app
+ENV NODE_ENV=production CODEX_METER_HOST=0.0.0.0 CODEX_METER_PORT=3000 CODEX_METER_DB=/data/meter.db
+COPY --chown=node:node package.json ./
+COPY --chown=node:node bin/v2-server.js ./bin/v2-server.js
+COPY --chown=node:node v2 ./v2
+RUN mkdir -p /data && chown node:node /data
+USER node
+EXPOSE 3000
+VOLUME ["/data"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD ["node", "-e", "fetch('http://127.0.0.1:3000/api/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+CMD ["node", "bin/v2-server.js"]
