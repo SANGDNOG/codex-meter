@@ -56,7 +56,7 @@ test('M6 Linux installer performs verified enrollment, protects files, registers
   await writeFile(path.join(mockbin,'curl'),`#!/bin/sh\ncase "$2" in *manifest.json) cp "$CM_MANIFEST" "$4";; *) cp "$CM_ARTIFACT" "$4";; esac\n`,{mode:0o700});
   await writeFile(path.join(mockbin,'systemctl'),`#!/bin/sh\nprintf '%s\\n' "$*" >> "$CM_LOG"\n`,{mode:0o700});
   try {
-    const result=await exec('sh',[path.join(ROOT,'install.sh'),'--server','http://127.0.0.1:9','--token','one_time_token'],{env:{...process.env,PATH:`${mockbin}:${process.env.PATH}`,CODEX_METER_HOME:home,CODEX_METER_ALLOW_HTTP_TESTS:'1',CM_MANIFEST:manifest,CM_ARTIFACT:artifact,CM_LOG:log},stdio:['ignore','pipe','pipe']});
+    const result=await exec('sh',[path.join(ROOT,'install.sh'),'--server','http://127.0.0.1:9','--token','one_time_token'],{env:{...process.env,PATH:`${mockbin}:${process.env.PATH}`,CODEX_METER_HOME:home,XDG_CONFIG_HOME:path.join(home,'.config'),XDG_STATE_HOME:path.join(home,'.local','state'),CODEX_METER_ALLOW_HTTP_TESTS:'1',CM_MANIFEST:manifest,CM_ARTIFACT:artifact,CM_LOG:log},stdio:['ignore','pipe','pipe']});
     assert.equal(result.code,0,result.err); const bin=path.join(home,'.local','bin','codex-meter-agent'), config=path.join(home,'.local','state','codex-meter','agent.json'), service=path.join(home,'.config','systemd','user','codex-meter-agent.service');
     assert.equal((await stat(config)).mode&0o777,0o600); assert.equal((await stat(service)).mode&0o777,0o600); assert.equal((await stat(bin)).mode&0o777,0o700);
     assert.match(await readFile(service,'utf8'),/ExecStart=.* run --config/); const commands=await readFile(log,'utf8'); assert.match(commands,/--user daemon-reload/); assert.match(commands,/--user enable --now/); assert.doesNotMatch(commands,/sudo/);
