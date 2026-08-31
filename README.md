@@ -10,12 +10,19 @@ V2 is the recommended architecture: one persistent per-user Agent on each monito
 
 ```sh
 cp compose.v2.example.yml compose.yml
+mkdir -p releases
+# Download manifest.json, SHA256SUMS, and all three native Agent artifacts
+# from one v2-agent-* GitHub Release into ./releases/, then verify them:
+(cd releases && sha256sum --check SHA256SUMS)
 export CODEX_METER_ADMIN_PASSWORD='replace-with-a-long-random-password'
 export CODEX_METER_SERVER_URL='https://meter.example.com'
 export CODEX_METER_TRUSTED_PROXIES='127.0.0.1,::1' # exact reverse-proxy backend source IP(s)
 docker compose up -d --build
-curl http://127.0.0.1:3000/api/v1/health
+curl -fsS http://127.0.0.1:3000/api/v1/health
+curl -fsS http://127.0.0.1:3000/api/v1/agent/releases/manifest.json
 ```
+
+The Compose example sets `CODEX_METER_RELEASE_DIR=/releases` and mounts host `./releases` at `/releases:ro`; Dashboard one-line installers depend on those release assets. The complete first-release tagging, asset download, checksum, and endpoint-verification procedure is in [V2 Server deployment](docs/v2-deployment.md).
 
 Put an HTTPS reverse proxy in front of the loopback-bound port. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and list the proxy's exact backend source IP in `CODEX_METER_TRUSTED_PROXIES` (Docker bridge/NAT deployments may not appear as loopback). Plaintext enrollment and Agent sync are rejected with HTTP 426. The single service stores its WAL-mode SQLite database at `/data/meter.db`; back up that file using a SQLite-safe backup or a stopped-container copy. Open the Dashboard, create Groups, choose **Add Device**, and run the displayed one-line installer. Released Agents for Linux x64, Windows x64, and macOS arm64 are self-contained and require no global Node.js or npm on monitored computers.
 

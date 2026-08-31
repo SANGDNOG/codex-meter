@@ -9,6 +9,7 @@ import { AgentCollector } from '../v2/agent/collector.js';
 import { AgentSyncClient } from '../v2/agent/sync.js';
 import { openServerDatabase } from '../v2/server/database.js';
 import { MeterService } from '../v2/server/service.js';
+import { createV2Server } from '../v2/server/http.js';
 
 function exec(command,args,options={}) { return new Promise(resolve=>{const child=spawn(command,args,options);let out='',err='';child.stdout?.on('data',c=>out+=c);child.stderr?.on('data',c=>err+=c);child.on('exit',code=>resolve({code,out,err}));}); }
 
@@ -76,6 +77,43 @@ test('M7 release manifest and checksums are deterministic and workflow enforces 
 test('M7 Docker/Compose are one nonroot Node 24 service with persistent SQLite and healthcheck', async () => {
   const docker=await readFile('Dockerfile.v2','utf8'), compose=await readFile('compose.v2.example.yml','utf8');
   assert.match(docker,/FROM node:24\.15\.0/); assert.match(docker,/USER node/); assert.match(docker,/CODEX_METER_DB=\/data\/meter\.db/); assert.match(docker,/HEALTHCHECK/);
-  assert.match(compose,/restart: unless-stopped/); assert.match(compose,/codex-meter-data:\/data/); assert.equal((compose.match(/^  codex-meter:/gm)||[]).length,1);
+  assert.match(compose,/restart: unless-stopped/); assert.match(compose,/codex-meter-data:\/data/);
+  assert.match(compose,/CODEX_METER_RELEASE_DIR: \/releases/);
+  assert.match(compose,/\.\/releases:\/releases:ro/);
+  assert.equal((compose.match(/^  codex-meter:/gm)||[]).length,1);
   assert.doesNotMatch(`${docker}\n${compose}`,/redis|postgres|rabbit|queue/i);
+});
+
+test('M7 configured release directory serves manifest and artifact while disabled and traversal requests stay inaccessible', async () => {
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m7-release-http-'));
+  const releases=path.join(root,'releases'); await mkdir(releases);
+  const manifest='{"schemaVersion":1,"version":"2.0.0","artifacts":{}}\n';
+  const artifact=Buffer.from('native-agent-fixture');
+  await writeFile(path.join(releases,'manifest.json'),manifest);
+  await writeFile(path.join(releases,'codex-meter-agent-linux-x64'),artifact);
+  await writeFile(path.join(root,'outside-secret'),'must-not-be-served');
+
+  const run=async(releaseDirectory,callback)=>{
+    const database=openServerDatabase(path.join(root,`server-${releaseDirectory?'configured':'disabled'}.db`));
+    const server=createV2Server({database,adminPassword:'release test administrator password',releaseDirectory});
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const base=`http://127.0.0.1:${server.address().port}`;
+    try { await callback(base); }
+    finally { await new Promise(resolve=>server.close(resolve)); database.close(); }
+  };
+
+  try {
+    await run(releases,async base=>{
+      let response=await fetch(`${base}/api/v1/agent/releases/manifest.json`);
+      assert.equal(response.status,200); assert.equal(await response.text(),manifest);
+      response=await fetch(`${base}/api/v1/agent/releases/codex-meter-agent-linux-x64`);
+      assert.equal(response.status,200); assert.deepEqual(Buffer.from(await response.arrayBuffer()),artifact);
+      response=await fetch(`${base}/api/v1/agent/releases/..%2Foutside-secret`);
+      assert.equal(response.status,401); assert.doesNotMatch(await response.text(),/must-not-be-served/);
+    });
+    await run(null,async base=>{
+      const response=await fetch(`${base}/api/v1/agent/releases/package.json`);
+      assert.equal(response.status,401); assert.doesNotMatch(await response.text(),/"name"\s*:\s*"codex-meter"/);
+    });
+  } finally { await rm(root,{recursive:true,force:true}); }
 });
