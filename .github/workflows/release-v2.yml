@@ -47,7 +47,9 @@ jobs:
           "$ARTIFACT" --version
           tmp="$(mktemp -d)"
           chmod 700 "$tmp"
-          printf '%s\n' '{"serverUrl":"http://127.0.0.1:9","deviceId":"smoke","deviceSecret":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","codexHome":"'"$tmp"'/codex","databasePath":"'"$tmp"'/agent.db","allowHttpForTests":true}' > "$tmp/agent.json"
+          config_tmp="$tmp"
+          if [ "$RUNNER_OS" = Windows ]; then config_tmp="$(cygpath -m "$tmp")"; fi
+          printf '%s\n' '{"serverUrl":"http://127.0.0.1:9","deviceId":"smoke","deviceSecret":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","codexHome":"'"$config_tmp"'/codex","databasePath":"'"$config_tmp"'/agent.db","allowHttpForTests":true}' > "$tmp/agent.json"
           chmod 600 "$tmp/agent.json"
           "$ARTIFACT" status --config "$tmp/agent.json"
       - uses: actions/upload-artifact@v4
