@@ -20,9 +20,9 @@ jobs:
           - target: windows-x64
             runner: windows-2025
             artifact: codex-meter-agent-windows-x64.exe
-          # xlarge is GitHub's native Apple-silicon runner, not an x64 cross-build.
+          # macos-14 is GitHub's standard Apple-silicon runner.
           - target: macos-arm64
-            runner: macos-14-xlarge
+            runner: macos-14
             artifact: codex-meter-agent-macos-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20

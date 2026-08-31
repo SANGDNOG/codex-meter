@@ -32,7 +32,7 @@ async function groupAndEnrollment(ctx, auth, name = 'Group A', device = 'Laptop'
   return { group: group.body, pending: pending.body };
 }
 async function enroll(ctx, token) { const result = await ctx.request('/api/v1/agent/enroll', { method: 'POST', value: { token } }); assert.equal(result.status, 201); return result.body; }
-function syncBody(events = []) { return { agentVersion: '2.0.0', codexVersion: '0.200.0', health: { status: 'healthy' }, events }; }
+function syncBody(events = []) { return { agentVersion: '2.0.1', codexVersion: '0.200.0', health: { status: 'healthy' }, events }; }
 function event(eventId, occurredAt, total, extra = {}) { return { eventId, occurredAt, inputTokens: total, cachedInputTokens: '0', cacheWriteInputTokens: null, outputTokens: '0', reasoningOutputTokens: '0', totalTokens: total, model: 'gpt-5', reasoningEffort: 'high', ...extra }; }
 function credential(device) { return `Bearer ${device.deviceId}.${device.deviceSecret}`; }
 
@@ -76,7 +76,7 @@ test('M2 strict sync is idempotent, private, bounded, updates health, and reject
   assert.deepEqual(first.body.acceptedEventIds, ['evt-1']); assert.deepEqual(first.body.duplicateEventIds, []);
   const retry = await ctx.request('/api/v1/agent/sync', { method: 'POST', authorization, value: syncBody([event('evt-1', ctx.time(), '9007199254740993')]) }); assert.deepEqual(retry.body.duplicateEventIds, ['evt-1']);
   assert.equal(ctx.database.prepare('SELECT COUNT(*) count FROM usage_events').get().count, 1);
-  const detail = await ctx.admin(`/api/v1/devices/${device.deviceId}`, {}, auth); assert.equal(detail.body.health, 'healthy'); assert.equal(detail.body.agentVersion, '2.0.0');
+  const detail = await ctx.admin(`/api/v1/devices/${device.deviceId}`, {}, auth); assert.equal(detail.body.health, 'healthy'); assert.equal(detail.body.agentVersion, '2.0.1');
   const leaked = event('bad', ctx.time(), '1', { groupId: pending.groupId }); assert.equal((await ctx.request('/api/v1/agent/sync', { method: 'POST', authorization, value: syncBody([leaked]) })).status, 400);
   assert.equal((await ctx.request('/api/v1/agent/sync', { method: 'POST', authorization, value: syncBody(Array.from({ length: 101 }, (_, i) => event(`x${i}`, ctx.time(), '1'))) })).status, 400);
   await ctx.admin(`/api/v1/devices/${device.deviceId}/disable`, { method: 'POST', value: { disabled: true } }, auth); assert.equal((await ctx.request('/api/v1/agent/sync', { method: 'POST', authorization, value: syncBody() })).status, 401);

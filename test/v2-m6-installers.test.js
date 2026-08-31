@@ -52,7 +52,7 @@ test('M6 Linux installer performs verified enrollment, protects files, registers
   const artifact=path.join(fixtures,'agent'); const manifest=path.join(fixtures,'manifest.json'); const log=path.join(dir,'commands.log');
   const agent=`#!/bin/sh\nconfig=''\nwhile [ "$#" -gt 0 ]; do [ "$1" = --config ] && { config=$2; shift 2; continue; }; shift; done\n[ -n "$config" ] || exit 2\nprintf '{"enrolled":true}\\n' > "$config"\n`;
   await writeFile(artifact,agent,{mode:0o700}); await chmod(artifact,0o700);
-  await writeFile(manifest,JSON.stringify({version:'2.0.0',artifacts:{'linux-x64':{url:'agent',sha256:digest(agent)}}}));
+  await writeFile(manifest,JSON.stringify({version:'2.0.1',artifacts:{'linux-x64':{url:'agent',sha256:digest(agent)}}}));
   await writeFile(path.join(mockbin,'curl'),`#!/bin/sh\ncase "$2" in *manifest.json) cp "$CM_MANIFEST" "$4";; *) cp "$CM_ARTIFACT" "$4";; esac\n`,{mode:0o700});
   await writeFile(path.join(mockbin,'systemctl'),`#!/bin/sh\nprintf '%s\\n' "$*" >> "$CM_LOG"\n`,{mode:0o700});
   try {

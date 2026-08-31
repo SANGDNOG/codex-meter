@@ -30,10 +30,10 @@ try {
   await run(process.execPath,['--experimental-sea-config',seaConfig]);
   await copyFile(process.execPath,executable); if(process.platform!=='win32')await chmod(executable,0o755);
   if(process.platform==='darwin')await run('codesign',['--remove-signature',executable]);
-  const postject=path.join(root,'node_modules','.bin',process.platform==='win32'?'postject.cmd':'postject');
+  const postjectCli=path.join(root,'node_modules','postject','dist','cli.js');
   const args=[executable,'NODE_SEA_BLOB',blob,'--sentinel-fuse','NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2'];
   if(process.platform==='darwin')args.push('--macho-segment-name','NODE_SEA');
-  await run(postject,args);
+  await run(process.execPath,[postjectCli,...args]);
   if(process.platform==='darwin')await run('codesign',['--sign','-','--force',executable]);
   console.log(executable);
 } finally { await rm(temporary,{recursive:true,force:true}); }

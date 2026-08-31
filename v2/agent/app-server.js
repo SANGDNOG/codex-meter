@@ -66,7 +66,7 @@ export class ReadOnlyAppServerClient {
     this.child.stdout.on('data', (chunk) => this.#consume(chunk));
     this.child.once('error', () => this.#rejectAll(new Error('App Server unavailable')));
     this.child.once('exit', () => this.#rejectAll(new Error('App Server exited')));
-    await this.#request('initialize', { clientInfo: { name: 'codex-meter-agent', title: 'Codex Meter Agent', version: '2.0.0' }, capabilities: null });
+    await this.#request('initialize', { clientInfo: { name: 'codex-meter-agent', title: 'Codex Meter Agent', version: '2.0.1' }, capabilities: null });
     this.#write({ method: 'initialized', params: null });
   }
   readAccount() { return this.#request('account/read', { refreshToken: false }); }

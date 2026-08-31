@@ -2,7 +2,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 
-export const AGENT_VERSION = '2.0.0';
+export const AGENT_VERSION = '2.0.1';
 export function defaultStateDirectory() {
   if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'CodexMeter');
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Codex Meter');

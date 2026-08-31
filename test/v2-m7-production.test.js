@@ -69,8 +69,11 @@ test('M7 release manifest and checksums are deterministic and workflow enforces 
     result=await exec(process.execPath,['scripts/release-v2-manifest.js',dir],{cwd:path.resolve('.'),stdio:['ignore','pipe','pipe']}); assert.equal(result.code,0,result.err); assert.equal(await readFile(path.join(dir,'manifest.json'),'utf8'),first);
     const manifest=JSON.parse(first); assert.deepEqual(Object.keys(manifest.artifacts),['linux-x64','macos-arm64','windows-x64']); assert.equal(sums.trim().split('\n').length,3);
     const workflow=await readFile('.github/workflows/release-v2.yml','utf8'); const packaging=await readFile('scripts/package-v2-agent.js','utf8');
-    for(const required of ['ubuntu-24.04','windows-2025','macos-14-xlarge','24.15.0','--version',' status --config','SHA256SUMS']) assert.ok(workflow.includes(required),`workflow missing ${required}`);
-    for(const required of ['NODE_SEA_BLOB','NODE_SEA_FUSE','codesign','--macho-segment-name']) assert.ok(packaging.includes(required),`packaging missing ${required}`);
+    for(const required of ['ubuntu-24.04','windows-2025','macos-14','24.15.0','--version',' status --config','SHA256SUMS']) assert.ok(workflow.includes(required),`workflow missing ${required}`);
+    assert.equal(workflow.includes('macos-14-xlarge'),false,'workflow must use the standard macOS runner');
+    for(const required of ['NODE_SEA_BLOB','NODE_SEA_FUSE','codesign','--macho-segment-name',"'postject','dist','cli.js'",'run(process.execPath,[postjectCli,...args])']) assert.ok(packaging.includes(required),`packaging missing ${required}`);
+    assert.equal(packaging.includes("'node_modules','.bin'"),false,'packaging must not invoke npm bin shims');
+    assert.equal(packaging.includes('postject.cmd'),false,'packaging must not invoke the Windows npm shim');
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
@@ -87,7 +90,7 @@ test('M7 Docker/Compose are one nonroot Node 24 service with persistent SQLite a
 test('M7 configured release directory serves manifest and artifact while disabled and traversal requests stay inaccessible', async () => {
   const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m7-release-http-'));
   const releases=path.join(root,'releases'); await mkdir(releases);
-  const manifest='{"schemaVersion":1,"version":"2.0.0","artifacts":{}}\n';
+  const manifest='{"schemaVersion":1,"version":"2.0.1","artifacts":{}}\n';
   const artifact=Buffer.from('native-agent-fixture');
   await writeFile(path.join(releases,'manifest.json'),manifest);
   await writeFile(path.join(releases,'codex-meter-agent-linux-x64'),artifact);

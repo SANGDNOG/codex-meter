@@ -9,8 +9,8 @@ For the first Agent release, create and push the version tag from the commit to 
 ```sh
 git switch main
 git pull --ff-only origin main
-git tag v2-agent-2.0.0
-git push origin v2-agent-2.0.0
+git tag v2-agent-2.0.1
+git push origin v2-agent-2.0.1
 ```
 
 The `v2-agent-*` tag triggers `.github/workflows/release-v2.yml`. GitHub Actions builds native `linux-x64`, `windows-x64`, and `macos-arm64` Agent binaries, creates `manifest.json` and `SHA256SUMS`, verifies the checksums, and publishes all five files as GitHub Release assets.
@@ -20,7 +20,7 @@ On the Server host, download that release into `./releases/`. This is a deployme
 ```sh
 mkdir -p releases
 cd releases
-release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.0.0'
+release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.0.1'
 for asset in \
   manifest.json \
   SHA256SUMS \
