@@ -70,6 +70,7 @@ test('M7 release manifest and checksums are deterministic and workflow enforces 
     const manifest=JSON.parse(first); assert.deepEqual(Object.keys(manifest.artifacts),['linux-x64','macos-arm64','windows-x64']); assert.equal(sums.trim().split('\n').length,3);
     const workflow=await readFile('.github/workflows/release-v2.yml','utf8'); const packaging=await readFile('scripts/package-v2-agent.js','utf8');
     for(const required of ['ubuntu-24.04','windows-2025','macos-14','24.15.0','--version',' status --config','SHA256SUMS','RUNNER_OS','cygpath -m']) assert.ok(workflow.includes(required),`workflow missing ${required}`);
+    assert.ok(workflow.includes('(cd dist/release-v2 && sha256sum --check SHA256SUMS)'),'workflow must verify checksums from the artifact directory');
     assert.equal(workflow.includes('macos-14-xlarge'),false,'workflow must use the standard macOS runner');
     for(const required of ['NODE_SEA_BLOB','NODE_SEA_FUSE','codesign','--macho-segment-name',"'postject','dist','cli.js'",'run(process.execPath,[postjectCli,...args])']) assert.ok(packaging.includes(required),`packaging missing ${required}`);
     assert.equal(packaging.includes("'node_modules','.bin'"),false,'packaging must not invoke npm bin shims');

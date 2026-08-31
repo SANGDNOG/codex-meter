@@ -75,7 +75,7 @@ jobs:
       - run: node scripts/release-v2-manifest.js dist/release-v2
       - name: Verify checksums and manifest deterministically
         run: |
-          sha256sum --check dist/release-v2/SHA256SUMS
+          (cd dist/release-v2 && sha256sum --check SHA256SUMS)
           cp dist/release-v2/manifest.json /tmp/manifest.json
           node scripts/release-v2-manifest.js dist/release-v2
           diff -u /tmp/manifest.json dist/release-v2/manifest.json
