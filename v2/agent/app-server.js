@@ -28,29 +28,38 @@ function windowValue(value, slot, limitId) {
 export function normalizeQuota(rateLimitsResult, observedAt = new Date().toISOString()) {
   if (!object(rateLimitsResult)) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType: null, windows: [] };
   const sources = [];
+  const hasById = Object.hasOwn(rateLimitsResult, 'rateLimitsByLimitId');
   const byId = rateLimitsResult.rateLimitsByLimitId;
-  if (object(byId)) for (const key of Object.keys(byId).sort()) sources.push([byId[key], atom(key)]);
-  if (object(rateLimitsResult.rateLimits)) sources.push([rateLimitsResult.rateLimits, null]);
+  if (hasById && byId != null && !object(byId)) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType: null, windows: [] };
+  const byIdKeys = object(byId) ? Object.keys(byId).sort() : [];
+  if (byIdKeys.length) {
+    for (const key of byIdKeys) {
+      if (!object(byId[key])) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType: null, windows: [] };
+      sources.push([byId[key], atom(key)]);
+    }
+  } else if (object(rateLimitsResult.rateLimits)) sources.push([rateLimitsResult.rateLimits, null]);
   if (!sources.length && (rateLimitsResult.primary || rateLimitsResult.secondary || rateLimitsResult.windows)) sources.push([rateLimitsResult, null]);
   const windows = [];
   let planType = null;
   for (const [source, fallbackId] of sources) {
     if (!object(source)) continue;
+    const sourceWindowStart = windows.length;
     const limitId = atom(source.limitId ?? source.limit_id) ?? fallbackId;
     planType ??= plan(source.planType ?? source.plan_type);
     for (const slot of ['primary', 'secondary']) {
-      if (source[slot] !== undefined) {
+      if (source[slot] !== undefined && source[slot] !== null) {
         const item = windowValue(source[slot], slot, limitId);
         if (item) windows.push(item); else return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType, windows: [] };
       }
     }
-    if (source.windows !== undefined) {
+    if (source.windows !== undefined && source.windows !== null) {
       if (!Array.isArray(source.windows) || source.windows.length > MAX_WINDOWS) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType, windows: [] };
       for (const raw of source.windows) {
         const item = windowValue(raw, raw?.slot, limitId);
         if (item) windows.push(item); else return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType, windows: [] };
       }
     }
+    if (windows.length === sourceWindowStart) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType, windows: [] };
   }
   if (!windows.length || windows.length > MAX_WINDOWS) return { observedAt, status: 'unavailable', errorKind: 'malformed_rate_limits', planType, windows: [] };
   const identities = windows.map((item) => `${item.limitId}\u0000${item.durationMinutes}`);

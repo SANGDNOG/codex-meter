@@ -40,6 +40,26 @@ test('M4 quota normalization uses limitId+duration identity across slot reorder;
   assert.equal(normalizeQuota({rateLimits:{primary:{windowDurationMins:300,usedPercent:1}}}).status,'unavailable');
 });
 
+test('M4 quota normalization accepts Codex 0.137 null optional windows and canonicalizes duplicate aliases',()=>{
+  const shared={limitId:'codex',planType:'pro',primary:{windowDurationMins:300,usedPercent:12,resetsAt:1788249600},secondary:null,windows:null};
+  const canonical={
+    codex:{...shared,primary:{...shared.primary}},
+    research:{limitId:'research',planType:'pro',primary:{windowDurationMins:300,usedPercent:8,resetsAt:1788249600},secondary:{windowDurationMins:10080,usedPercent:2,resetsAt:1788854400}}
+  };
+  const result=normalizeQuota({rateLimits:{...shared,primary:{...shared.primary,usedPercent:99}},rateLimitsByLimitId:canonical});
+  assert.equal(result.status,'available');assert.equal(result.errorKind,undefined);assert.equal(result.planType,'pro');
+  assert.deepEqual(result.windows.map(x=>`${x.limitId}:${x.durationMinutes}`),['codex:300','research:300','research:10080']);
+  assert.equal(result.windows.find(x=>x.limitId==='codex').usedPercent,12);
+  assert.equal(normalizeQuota({rateLimits:{...shared,primary:null,secondary:null,windows:[{limitId:'codex',durationMinutes:300,usedPercent:1}]}}).status,'available');
+  assert.equal(normalizeQuota({rateLimits:{...shared,primary:'malformed'}}).status,'unavailable');
+  assert.equal(normalizeQuota({rateLimits:shared,rateLimitsByLimitId:{}}).status,'available');
+  const assertMalformed=(value)=>{assert.equal(value.status,'unavailable');assert.equal(value.errorKind,'malformed_rate_limits');};
+  for(const absent of [null,undefined]) assert.equal(normalizeQuota({rateLimits:shared,rateLimitsByLimitId:absent}).status,'available');
+  for(const malformed of [[], 'malformed']) assertMalformed(normalizeQuota({rateLimits:shared,rateLimitsByLimitId:malformed}));
+  for(const malformed of [null,[], 'malformed',{}, {primary:null,secondary:null,windows:null}, {limitId:'empty'}])
+    assertMalformed(normalizeQuota({rateLimitsByLimitId:{codex:canonical.codex,malformed}}));
+});
+
 async function serverFixture(callback){const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m4-server-'));const database=openServerDatabase(path.join(root,'db.sqlite'));let now=NOW;try{const service=new MeterService(database,{adminPassword:'long enough test password',clock:()=>now,quotaStaleMs:60_000});
   const add=(id)=>{database.prepare('INSERT INTO devices(id,name,credential_hash,created_at,updated_at) VALUES(?,?,?,?,?)').run(id,id,'hash',new Date(now).toISOString(),new Date(now).toISOString());return database.prepare('SELECT * FROM devices WHERE id=?').get(id);};await callback({database,service,a:add('reporter'),b:add('other'),advance(ms){now+=ms;}});
   }finally{database.close();await rm(root,{recursive:true,force:true});}}
