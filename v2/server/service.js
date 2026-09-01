@@ -40,6 +40,23 @@ function timestamp(value, field = 'timestamp') {
   if (!Number.isFinite(time)) fail(400, 'invalid_field', `invalid ${field}`);
   return new Date(time).toISOString();
 }
+function encodeQuotaCursor(observedAt, observationId) {
+  return Buffer.from(`${observedAt}\u0000${observationId}`, 'utf8').toString('base64url');
+}
+function parseQuotaCursor(value) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 512 || !/^[A-Za-z0-9_-]+$/.test(value)) fail(400, 'invalid_cursor');
+  let decoded;
+  try {
+    const bytes=Buffer.from(value,'base64url');
+    if(bytes.toString('base64url')!==value)fail(400,'invalid_cursor');
+    decoded=bytes.toString('utf8');
+  } catch(error) { if(error instanceof ServiceError)throw error;fail(400,'invalid_cursor'); }
+  const parts=decoded.split('\u0000');
+  if(parts.length!==2)fail(400,'invalid_cursor');
+  const parsedTime=Date.parse(parts[0]);
+  if(!Number.isFinite(parsedTime)||new Date(parsedTime).toISOString()!==parts[0]||!/^[A-Za-z0-9_-]{1,128}$/.test(parts[1]))fail(400,'invalid_cursor');
+  return{observedAt:parts[0],observationId:parts[1]};
+}
 function parseQuotaReport(value) {
   exact(value, ['observedAt','status','planType','windows'],['errorKind']);
   const observedAt=timestamp(value.observedAt,'observedAt');
@@ -380,10 +397,13 @@ export class MeterService {
   }
   accountQuotaHistory(accountId,{limit=100,before=null}={}){
     id(accountId,'accountId');if(!this.database.prepare('SELECT 1 FROM accounts WHERE id=?').get(accountId))fail(404,'account_not_found');
-    if(!Number.isInteger(limit)||limit<1||limit>500)fail(400,'invalid_limit');const boundary=before===null?null:timestamp(before,'before');
-    const observations=this.database.prepare(`SELECT observation_id,MAX(observed_at) observed_at FROM account_quota_snapshots WHERE account_id=? ${boundary?'AND observed_at < ?':''} GROUP BY observation_id ORDER BY observed_at DESC,observation_id DESC LIMIT ?`).all(...(boundary?[accountId,boundary,limit]:[accountId,limit]));
+    if(!Number.isInteger(limit)||limit<1||limit>500)fail(400,'invalid_limit');const boundary=before===null?null:parseQuotaCursor(before);
+    const rows=this.database.prepare(`SELECT observation_id,observed_at FROM account_quota_snapshots WHERE account_id=? ${boundary?'AND (observed_at < ? OR (observed_at = ? AND observation_id < ?))':''} GROUP BY observation_id,observed_at ORDER BY observed_at DESC,observation_id DESC LIMIT ?`).all(...(boundary?[accountId,boundary.observedAt,boundary.observedAt,boundary.observationId,limit+1]:[accountId,limit+1]));
+    const hasMore=rows.length>limit,observations=rows.slice(0,limit);
     const statement=this.database.prepare('SELECT * FROM account_quota_snapshots WHERE account_id=? AND observation_id=? ORDER BY limit_id,duration_minutes');
-    return{observations:observations.map((observation)=>{const rows=statement.all(accountId,observation.observation_id);const first=rows[0];return{observationId:observation.observation_id,observedAt:first.observed_at,status:first.status,errorKind:first.error_kind??null,reporterDeviceId:first.reporter_device_id,planType:first.plan_type,windows:rows.filter((row)=>row.limit_id!==null).map((row)=>({limitId:row.limit_id,durationMinutes:row.duration_minutes,usedPercent:row.used_percent,resetsAt:row.resets_at,slot:row.slot}))};})};
+    const result=observations.map((observation)=>{const observationRows=statement.all(accountId,observation.observation_id);const first=observationRows[0];return{observationId:observation.observation_id,observedAt:first.observed_at,status:first.status,errorKind:first.error_kind??null,reporterDeviceId:first.reporter_device_id,planType:first.plan_type,windows:observationRows.filter((row)=>row.limit_id!==null).map((row)=>({limitId:row.limit_id,durationMinutes:row.duration_minutes,usedPercent:row.used_percent,resetsAt:row.resets_at,slot:row.slot}))};});
+    const last=observations.at(-1);
+    return{observations:result,nextCursor:hasMore?encodeQuotaCursor(last.observed_at,last.observation_id):null};
   }
 
   range(value) {

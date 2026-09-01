@@ -1,6 +1,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { chmod, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { parse as parseToml } from 'smol-toml';
 
 export const AGENT_VERSION = '2.1.0-dev';
 export function defaultStateDirectory() {
@@ -78,32 +79,25 @@ export async function initializeManagedHome(codexHome, profileAccountId) {
   const homeInfo=await lstat(home);if(homeInfo.isSymbolicLink()||!homeInfo.isDirectory())throw new Error('managed CODEX_HOME must be a real directory, not a symbolic link');
   const markerPath = path.join(home, PROFILE_MARKER);
   try {
-    if ((await lstat(markerPath)).isSymbolicLink()) throw new Error('managed profile marker must not be a symbolic link');
+    const markerInfo=await lstat(markerPath);
+    if (markerInfo.isSymbolicLink() || !markerInfo.isFile()) throw new Error('managed profile marker must be a regular file, not a symbolic link');
     const marker = JSON.parse(await readFile(markerPath, 'utf8'));
     if (!plain(marker) || Object.keys(marker).sort().join(',') !== 'accountId,version' || marker.version !== 1 || marker.accountId !== owner)
       throw new Error('CODEX_HOME is owned by a different Account Profile');
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const configPath = path.join(home, 'config.toml');
-  try { if ((await lstat(configPath)).isSymbolicLink()) throw new Error('managed config.toml must not be a symbolic link'); }
+  try { const configInfo=await lstat(configPath);if(configInfo.isSymbolicLink()||!configInfo.isFile())throw new Error('managed config.toml must be a regular file, not a symbolic link'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   let contents;
   try { contents = await readFile(configPath, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (contents !== undefined) {
-    if (contents.includes('"""') || contents.includes("'''")) throw new Error('cannot safely validate multiline TOML in managed config.toml');
-    let inTable = false; const matches = [];
-    for (const line of contents.split(/\r?\n/)) {
-      const stripped = line.trim();
-      const quotedKey=stripped.match(/^"((?:[^"\\]|\\.)*)"\s*(?:=|\.)/);
-      if(quotedKey?.[1].includes('\\'))throw new Error('cannot safely validate escaped quoted TOML keys in managed config.toml');
-      if (/^\[\[?/.test(stripped)) inTable = true;
-      const match = stripped.match(/^(?:cli_auth_credentials_store|"cli_auth_credentials_store"|'cli_auth_credentials_store')\s*=\s*("file"|'file')\s*(?:#.*)?$/);
-      const anyKey = /^(?:cli_auth_credentials_store|"cli_auth_credentials_store"|'cli_auth_credentials_store')(?:\s*=|\s*\.)/.test(stripped);
-      if (match) matches.push({ value: match[1], topLevel: !inTable });
-      else if (anyKey) matches.push({ value: null, topLevel: !inTable });
-    }
-    if (matches.length > 1 || (matches.length === 1 && (!matches[0].topLevel || !/^[\"']file[\"']$/.test(matches[0].value))))
+    let parsed;
+    try { parsed = parseToml(contents); }
+    catch { throw new Error('cannot safely parse managed config.toml'); }
+    const hasCredentialStore = Object.prototype.hasOwnProperty.call(parsed, 'cli_auth_credentials_store');
+    if (hasCredentialStore && parsed.cli_auth_credentials_store !== 'file')
       throw new Error('conflicting cli_auth_credentials_store in config.toml');
-    if (!matches.length) {
+    if (!hasCredentialStore) {
       const temporary = `${configPath}.${process.pid}.tmp`;
       try {
         await writeFile(temporary, `cli_auth_credentials_store = \"file\"\n${contents}`, { mode: 0o600, flag: 'wx' });
@@ -132,7 +126,7 @@ export async function initializeManagedHome(codexHome, profileAccountId) {
 export function profileLauncher(profile, platform = process.platform) {
   if (!profile?.codexHome) throw new Error('profile is required'); const home=safeHome(profile.codexHome);
   const executable=profile.codexExecutable===undefined?'codex':safeExecutable(profile.codexExecutable);
-  if (platform === 'win32') return `$hadCodexHome = Test-Path Env:CODEX_HOME\n$previousCodexHome = $env:CODEX_HOME\ntry {\n  $env:CODEX_HOME = '${home.replaceAll("'", "''")}'\n  & '${executable.replaceAll("'", "''")}' @args\n} finally {\n  if ($hadCodexHome) { $env:CODEX_HOME = $previousCodexHome } else { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue }\n}\n`;
+  if (platform === 'win32') return `$hadCodexHome = Test-Path Env:CODEX_HOME\n$previousCodexHome = $env:CODEX_HOME\n$codexExitCode = 0\ntry {\n  $env:CODEX_HOME = '${home.replaceAll("'", "''")}'\n  $global:LASTEXITCODE = $null\n  & '${executable.replaceAll("'", "''")}' @args\n  $commandSucceeded = $?\n  $nativeExitCode = $LASTEXITCODE\n  if ($null -ne $nativeExitCode) { $codexExitCode = $nativeExitCode } elseif (-not $commandSucceeded) { $codexExitCode = 1 }\n} finally {\n  if ($hadCodexHome) { $env:CODEX_HOME = $previousCodexHome } else { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue }\n}\nexit $codexExitCode\n`;
   return `#!/bin/sh\nexport CODEX_HOME='${home.replaceAll("'", "'\"'\"'")}'\nexec '${executable.replaceAll("'", "'\"'\"'")}' \"$@\"\n`;
 }
 async function requireProtected(filename) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import os from 'node:os';
@@ -66,12 +66,27 @@ test('V2.1 profile quota rejects duplicates/future time, ignores late current re
   assert.throws(()=>service.accountQuotaHistory(account.id,{limit:501}),/invalid_limit/);
 }));
 
+test('V2.1 quota history composite cursor returns every same-timestamp observation exactly once',()=>fixture(async({database,service,addDevice})=>{
+  const account=service.createAccount({name:'Paged'}),other=service.createAccount({name:'Other'}),device=addDevice('paged-device');
+  service.bindAccount(device.id,{accountId:account.id,codexHomeKey:'paged'});service.bindAccount(device.id,{accountId:other.id,codexHomeKey:'other'});
+  for(let index=0;index<7;index+=1)service.sync(device,body([],[available(account.id,index+1)]));
+  service.sync(device,body([],[available(other.id,99)]));
+  const expected=database.prepare('SELECT DISTINCT observation_id FROM account_quota_snapshots WHERE account_id=? ORDER BY observation_id DESC').all(account.id).map(row=>row.observation_id);
+  const actual=[];let before=null,pages=0;
+  do{const page=service.accountQuotaHistory(account.id,{limit:2,before});pages+=1;actual.push(...page.observations.map(row=>row.observationId));before=page.nextCursor;}while(before!==null);
+  assert.ok(pages>3);assert.deepEqual(actual,expected);assert.equal(new Set(actual).size,expected.length);
+  assert.equal(service.accountQuotaHistory(other.id,{limit:2}).observations.length,1);
+  for(const invalid of ['', '***', Buffer.from('bad').toString('base64url'), Buffer.from('0\u0000x').toString('base64url'), Buffer.from('2026-09-01T12:00:00.000Z\u0000bad/id').toString('base64url')])
+    assert.throws(()=>service.accountQuotaHistory(account.id,{limit:2,before:invalid}),error=>error instanceof ServiceError&&['invalid_cursor','invalid_field'].includes(error.code));
+}));
+
 test('V2.1 authenticated account quota history API is bounded',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-history-')),database=openServerDatabase(path.join(root,'server.db'));const server=createV2Server({database,adminPassword:'long enough test password',clock:()=>NOW});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const base=`http://127.0.0.1:${server.address().port}`;
   try{const account=server.service.createAccount({name:'History'});const login=await fetch(`${base}/api/v1/auth/login`,{method:'POST',headers:{origin:base,'content-type':'application/json'},body:JSON.stringify({password:'long enough test password'})});const cookie=login.headers.get('set-cookie').split(';')[0];
-    const response=await fetch(`${base}/api/v1/accounts/${account.id}/quota/history?limit=1`,{headers:{origin:base,cookie}});assert.equal(response.status,200);assert.deepEqual(await response.json(),{observations:[]});
+    const response=await fetch(`${base}/api/v1/accounts/${account.id}/quota/history?limit=1`,{headers:{origin:base,cookie}});assert.equal(response.status,200);assert.deepEqual(await response.json(),{observations:[],nextCursor:null});
     const invalid=await fetch(`${base}/api/v1/accounts/${account.id}/quota/history?limit=501`,{headers:{origin:base,cookie}});assert.equal(invalid.status,400);
+    const invalidCursor=await fetch(`${base}/api/v1/accounts/${account.id}/quota/history?before=not-a-cursor`,{headers:{origin:base,cookie}});assert.equal(invalidCursor.status,400);
   }finally{await new Promise(resolve=>server.close(resolve));database.close();await rm(root,{recursive:true,force:true});}
 });
 
@@ -107,6 +122,18 @@ test('V2.1 managed homes are private, permanently owned, conflict-safe, launcher
   }finally{await rm(root,{recursive:true,force:true});}
 });
 
+test('V2.1 managed home rejects root and marker symlinks while accepting owned real directories',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-symlink-'));
+  try{
+    const target=path.join(root,'target');await initializeManagedHome(target,'target-account');
+    const linked=path.join(root,'linked');await symlink(target,linked,'dir');await assert.rejects(initializeManagedHome(linked,'target-account'),/real directory/);
+    const markerHome=path.join(root,'marker-home');await mkdir(markerHome);const external=path.join(root,'marker.json');await writeFile(external,JSON.stringify({version:1,accountId:'marker-account'}));await symlink(external,path.join(markerHome,'.codex-meter-profile.json'));await assert.rejects(initializeManagedHome(markerHome,'marker-account'),/marker.*symbolic link/);
+    const markerDirectoryHome=path.join(root,'marker-directory');await mkdir(path.join(markerDirectoryHome,'.codex-meter-profile.json'),{recursive:true});await assert.rejects(initializeManagedHome(markerDirectoryHome,'marker-directory-account'),/marker must be a regular file/);
+    const configDirectoryHome=path.join(root,'config-directory');await mkdir(path.join(configDirectoryHome,'config.toml'),{recursive:true});await assert.rejects(initializeManagedHome(configDirectoryHome,'config-directory-account'),/config.toml must be a regular file/);
+    const unrelated=path.join(root,'unrelated');await mkdir(unrelated);await writeFile(path.join(unrelated,'config.toml'),'theme = "dark"\n');await initializeManagedHome(unrelated,'new-owner');assert.equal((await lstat(unrelated)).isDirectory(),true);
+  }finally{await rm(root,{recursive:true,force:true});}
+});
+
 test('V2.1 profile-add initializes a dedicated home and preserves existing TOML tables',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-cli-'));
   try{
@@ -119,8 +146,17 @@ test('V2.1 profile-add initializes a dedicated home and preserves existing TOML 
     const other=path.join(root,'existing');await mkdir(other);await writeFile(path.join(other,'config.toml'),'[projects]\ntrust = "all"\n');
     await initializeManagedHome(other,'profile-existing');
     assert.equal(await readFile(path.join(other,'config.toml'),'utf8'),'cli_auth_credentials_store = "file"\n[projects]\ntrust = "all"\n');
-    const quoted=path.join(root,'quoted');await mkdir(quoted);await writeFile(path.join(quoted,'config.toml'),'"cli_auth_credentials_store" = "keyring"\n');await assert.rejects(initializeManagedHome(quoted,'quoted-profile'),/conflicting/);
-    const multiline=path.join(root,'multiline');await mkdir(multiline);await writeFile(path.join(multiline,'config.toml'),'note = """unsafe to edit"""\n');await assert.rejects(initializeManagedHome(multiline,'multiline-profile'),/multiline TOML/);
+    const cases=[
+      ['bare','cli_auth_credentials_store = "file"\n',true],
+      ['quoted','"cli_auth_credentials_store" = "file"\n',true],
+      ['escaped','"cli_auth_credent\\u0069als_store" = "file"\n',true],
+      ['conflict','cli_auth_credentials_store = "keyring"\n',false],
+      ['escaped-conflict','"cli_auth_credent\\u0069als_store" = "keyring"\n',false],
+      ['malformed','"cli_auth_credentials_store = "file"\n',false],
+      ['duplicate','cli_auth_credentials_store = "file"\n"cli_auth_credent\\u0069als_store" = "file"\n',false]
+    ];
+    for(const [label,toml,allowed] of cases){const directory=path.join(root,label);await mkdir(directory);await writeFile(path.join(directory,'config.toml'),toml);if(allowed){await initializeManagedHome(directory,`${label}-profile`);assert.equal(await readFile(path.join(directory,'config.toml'),'utf8'),toml);}else await assert.rejects(initializeManagedHome(directory,`${label}-profile`),/conflicting|safely parse/);}
+    const multiline=path.join(root,'multiline');await mkdir(multiline);await writeFile(path.join(multiline,'config.toml'),'note = """safe to parse"""\n');await initializeManagedHome(multiline,'multiline-profile');assert.match(await readFile(path.join(multiline,'config.toml'),'utf8'),/^cli_auth_credentials_store/);
   }finally{await rm(root,{recursive:true,force:true});}
 });
 
@@ -132,6 +168,13 @@ test('V2.1 POSIX launcher preserves literal CODEX_HOME and arguments',async()=>{
     await exec(launcher,['argument with spaces','$literal'],{env:{...process.env,PATH:`${bin}:${process.env.PATH}`,CAPTURE:capture}});
     assert.deepEqual(JSON.parse(await readFile(capture,'utf8')),{home:path.resolve(home),args:['argument with spaces','$literal']});
   }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('V2.1 PowerShell launcher restores CODEX_HOME presence and value in finally',()=>{
+  const launcher=profileLauncher({codexHome:"./Profiles/O'Brien",codexExecutable:"/Program Files/O'Brien/codex.exe"},'win32');
+  assert.match(launcher,/\$hadCodexHome = Test-Path Env:CODEX_HOME/);assert.match(launcher,/\$previousCodexHome = \$env:CODEX_HOME/);
+  assert.match(launcher,/try \{/);assert.match(launcher,/finally \{/);assert.match(launcher,/if \(\$hadCodexHome\) \{ \$env:CODEX_HOME = \$previousCodexHome \} else \{ Remove-Item Env:CODEX_HOME/);
+  assert.match(launcher,/O''Brien/);assert.match(launcher,/@args/);assert.match(launcher,/\$global:LASTEXITCODE = \$null/);assert.match(launcher,/\$nativeExitCode = \$LASTEXITCODE/);assert.match(launcher,/\$codexExitCode = \$nativeExitCode/);assert.match(launcher,/exit \$codexExitCode/);
 });
 
 test('V2.1 payload/schema sources never identify provider accounts or access auth.json',async()=>{

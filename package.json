@@ -32,5 +32,8 @@
   "devDependencies": {
     "esbuild": "0.25.9",
     "postject": "1.0.0-alpha.6"
+  },
+  "dependencies": {
+    "smol-toml": "1.6.1"
   }
 }
