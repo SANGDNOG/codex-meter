@@ -95,6 +95,26 @@ function tx(database, callback) {
 function rowsBig(database, sql, ...params) {
   const statement = database.prepare(sql); statement.setReadBigInts(true); return statement.all(...params);
 }
+const QUOTA_PERCENT_SCALE = 1_000_000n;
+function quotaCycleBoundary(resetsAt, durationMinutes) {
+  if (typeof resetsAt !== 'string' || !Number.isSafeInteger(durationMinutes) || durationMinutes <= 0 || durationMinutes > Math.floor(Number.MAX_SAFE_INTEGER / 60_000)) return null;
+  const resetMs = Date.parse(resetsAt); const durationMs = durationMinutes * 60_000;
+  if (!Number.isFinite(resetMs) || !Number.isSafeInteger(durationMs)) return null;
+  const startMs = resetMs - durationMs;
+  if (!Number.isFinite(startMs) || startMs >= resetMs) return null;
+  try { return { cycleStart: new Date(startMs).toISOString(), resetsAt: new Date(resetMs).toISOString(), resetMs }; } catch { return null; }
+}
+function quotaRatioPercent(part, total) {
+  if (total === 0n) return null;
+  const scaled = (part * 100n * QUOTA_PERCENT_SCALE + total / 2n) / total;
+  return Number(scaled) / Number(QUOTA_PERCENT_SCALE);
+}
+function quotaContribution(basisPercentagePoints, part, total) {
+  if (total === 0n || typeof basisPercentagePoints !== 'number' || !Number.isFinite(basisPercentagePoints)) return null;
+  const basis = BigInt(Math.round(basisPercentagePoints * Number(QUOTA_PERCENT_SCALE)));
+  const scaled = (basis * part + total / 2n) / total;
+  return Number(scaled) / Number(QUOTA_PERCENT_SCALE);
+}
 function tokenObject(row, prefix = '') {
   const result = {};
   for (let index = 0; index < DIMENSIONS.length; index += 1) {
@@ -390,7 +410,10 @@ export class MeterService {
   }
   accountQuota(accountId){
     id(accountId,'accountId');const rows=this.database.prepare('SELECT * FROM account_quota_current WHERE account_id=? ORDER BY limit_id,duration_minutes').all(accountId);
-    if(!rows.length){const reporters=this.database.prepare(`SELECT d.* FROM device_account_bindings b JOIN devices d ON d.id=b.device_id WHERE b.account_id=? AND b.disabled_at IS NULL AND d.disabled_at IS NULL AND d.removed_at IS NULL`).all(accountId);const online=reporters.some((row)=>this.deviceState(row)==='online');return{observedAt:null,status:'unavailable',reporterState:!reporters.length?'no_reporter':online?'collection_failed':'reporter_offline',reporterDeviceId:null,errorKind:null,planType:null,windows:[]};}
+    const reporters=this.database.prepare(`SELECT d.* FROM device_account_bindings b JOIN devices d ON d.id=b.device_id WHERE b.account_id=? AND b.disabled_at IS NULL AND d.disabled_at IS NULL AND d.removed_at IS NULL`).all(accountId);const anyReporterOnline=reporters.some((row)=>this.deviceState(row)==='online');
+    if(!rows.length)return{observedAt:null,status:'unavailable',reporterState:!reporters.length?'no_reporter':anyReporterOnline?'collection_failed':'reporter_offline',reporterDeviceId:null,errorKind:null,planType:null,windows:[]};
+    const reporterEligible=reporters.some((row)=>row.id===rows[0].reporter_device_id);
+    if(!reporterEligible)return{observedAt:rows[0].observed_at,status:'unavailable',reporterState:!reporters.length?'no_reporter':anyReporterOnline?'collection_failed':'reporter_offline',reporterDeviceId:null,errorKind:rows[0].error_kind??null,planType:rows[0].plan_type,windows:rows.filter((row)=>row.limit_id!==null).map((row)=>({limitId:row.limit_id,durationMinutes:row.duration_minutes,usedPercent:row.used_percent,resetsAt:row.resets_at,slot:row.slot}))};
     const stale=this.clock()-Date.parse(rows[0].observed_at)>this.quotaStaleMs;
     const reporter=this.database.prepare('SELECT * FROM devices WHERE id=?').get(rows[0].reporter_device_id);const online=reporter&&this.deviceState(reporter)==='online';const reporterState=!online?'reporter_offline':stale?'stale_observation':rows[0].status==='available'?'available':'collection_failed';
     return{observedAt:rows[0].observed_at,status:stale?'stale':rows[0].status,...(stale?{sourceStatus:rows[0].status}:{}),reporterState,reporterDeviceId:rows[0].reporter_device_id,errorKind:rows[0].error_kind??null,planType:rows[0].plan_type,windows:rows.filter((row)=>row.limit_id!==null).map((row)=>({limitId:row.limit_id,durationMinutes:row.duration_minutes,usedPercent:row.used_percent,resetsAt:row.resets_at,slot:row.slot}))};
@@ -404,6 +427,77 @@ export class MeterService {
     const result=observations.map((observation)=>{const observationRows=statement.all(accountId,observation.observation_id);const first=observationRows[0];return{observationId:observation.observation_id,observedAt:first.observed_at,status:first.status,errorKind:first.error_kind??null,reporterDeviceId:first.reporter_device_id,planType:first.plan_type,windows:observationRows.filter((row)=>row.limit_id!==null).map((row)=>({limitId:row.limit_id,durationMinutes:row.duration_minutes,usedPercent:row.used_percent,resetsAt:row.resets_at,slot:row.slot}))};});
     const last=observations.at(-1);
     return{observations:result,nextCursor:hasMore?encodeQuotaCursor(last.observed_at,last.observation_id):null};
+  }
+
+  quotaAttribution(accountId) {
+    id(accountId,'accountId');
+    if(!this.database.prepare('SELECT 1 FROM accounts WHERE id=?').get(accountId))fail(404,'account_not_found');
+    const quota=this.accountQuota(accountId),now=this.clock();
+    const currentRows=this.database.prepare('SELECT * FROM account_quota_current WHERE account_id=? AND limit_id IS NOT NULL ORDER BY limit_id,duration_minutes').all(accountId);
+    const candidates=[];
+    for(const row of currentRows)candidates.push({...row,fromCurrent:true});
+    if(!candidates.length){
+      const history=this.database.prepare(`SELECT * FROM account_quota_snapshots WHERE account_id=? AND status='available' AND limit_id IS NOT NULL ORDER BY observed_at DESC,id DESC`).all(accountId);
+      const seen=new Set();
+      for(const row of history){
+        const key=`${row.limit_id}\u0000${row.duration_minutes}`;
+        if(seen.has(key))continue;
+        const boundary=quotaCycleBoundary(row.resets_at,row.duration_minutes);
+        if(!boundary||boundary.resetMs<=now)continue;
+        seen.add(key);candidates.push({...row,fromCurrent:false});
+      }
+      candidates.sort((a,b)=>a.limit_id.localeCompare(b.limit_id)||a.duration_minutes-b.duration_minutes);
+    }
+    const legacyEventsPresent=Boolean(this.database.prepare('SELECT 1 FROM usage_events WHERE account_id IS NULL LIMIT 1').get());
+    const historicalGroups=this.database.prepare(`SELECT DISTINCT g.id,g.name FROM usage_events u JOIN groups g ON g.id=u.resolved_group_id WHERE u.account_id=? ORDER BY g.name,g.id`).all(accountId);
+    const windows=candidates.map((candidate)=>{
+      const providerCurrent=candidate.fromCurrent&&candidate.status==='available'&&(quota.status==='available'||(quota.status==='stale'&&quota.sourceStatus==='available'));
+      const base={limitId:candidate.limit_id,durationMinutes:candidate.duration_minutes,slot:candidate.slot??null,usedPercent:providerCurrent?candidate.used_percent:null,resetsAt:candidate.resets_at??null,cycleStart:null,coverage:{status:'unknown',from:null,baselineUsedPercent:null},estimate:{status:'unavailable',basisPercentagePoints:null,semantics:null,basedOnObservedAt:quota.observedAt,reason:'cycle_boundary_unknown'},tracked:{from:null,to:null,totalTokens:null},groups:[]};
+      const boundary=quotaCycleBoundary(candidate.resets_at,candidate.duration_minutes);
+      if(!boundary)return base;
+      if(boundary.resetMs<=now){base.usedPercent=null;base.resetsAt=null;base.estimate.reason='quota_snapshot_expired';return base;}
+      base.resetsAt=boundary.resetsAt;base.cycleStart=boundary.cycleStart;
+      const cycleRows=this.database.prepare(`SELECT * FROM account_quota_snapshots WHERE account_id=? AND limit_id=? AND duration_minutes=? AND status='available' AND resets_at=? AND observed_at>=? AND observed_at<? ORDER BY observed_at,id`).all(accountId,candidate.limit_id,candidate.duration_minutes,boundary.resetsAt,boundary.cycleStart,boundary.resetsAt);
+      if(!cycleRows.length)return base;
+      const earliestAt=cycleRows[0].observed_at;
+      const baselineRows=cycleRows.filter((row)=>row.observed_at===earliestAt);
+      const baselineValues=new Set(baselineRows.map((row)=>row.used_percent));
+      const transitionConflict=Boolean(this.database.prepare(`SELECT 1 FROM account_quota_snapshots WHERE account_id=? AND limit_id=? AND duration_minutes=? AND status='available' AND observed_at=? AND (resets_at IS NULL OR resets_at<>?) LIMIT 1`).get(accountId,candidate.limit_id,candidate.duration_minutes,earliestAt,boundary.resetsAt));
+      if(baselineValues.size!==1||transitionConflict){
+        base.estimate={...base.estimate,status:'ambiguous',reason:'baseline_conflict'};
+        return base;
+      }
+      const baselineUsedPercent=baselineRows[0].used_percent;
+      const preceding=this.database.prepare(`SELECT * FROM account_quota_snapshots WHERE account_id=? AND limit_id=? AND duration_minutes=? AND status='available' AND observed_at<? ORDER BY observed_at DESC,id DESC LIMIT 1`).get(accountId,candidate.limit_id,candidate.duration_minutes,earliestAt);
+      const priorBoundary=preceding&&quotaCycleBoundary(preceding.resets_at,preceding.duration_minutes);
+      const priorCycle=Boolean(
+        priorBoundary?.resetsAt===boundary.cycleStart&&
+        Date.parse(preceding.observed_at)<=Date.parse(boundary.cycleStart)
+      );
+      const coverageStatus=priorCycle?'full':'partial';
+      const coverageFrom=priorCycle?boundary.cycleStart:(earliestAt<boundary.cycleStart?boundary.cycleStart:earliestAt);
+      base.coverage={status:coverageStatus,from:coverageFrom,baselineUsedPercent:coverageStatus==='partial'?baselineUsedPercent:null};
+      const trackedTo=new Date(Math.min(now,boundary.resetMs)).toISOString();
+      const eventRows=rowsBig(this.database,`SELECT resolved_group_id,total_tokens FROM usage_events WHERE account_id=? AND occurred_at>=? AND occurred_at<=?`,accountId,coverageFrom,trackedTo);
+      const totals=new Map();let total=0n;
+      for(const row of eventRows){const key=row.resolved_group_id??null;const value=row.total_tokens??0n;totals.set(key,(totals.get(key)??0n)+value);total+=value;}
+      base.tracked={from:coverageFrom,to:trackedTo,totalTokens:total.toString()};
+      const semantics=coverageStatus==='full'?'full_cycle':'since_tracking_began';
+      let basis=providerCurrent?(coverageStatus==='full'?candidate.used_percent:candidate.used_percent-baselineUsedPercent):null;
+      let estimateStatus='unavailable',reason=providerCurrent?null:'provider_quota_unavailable';
+      if(providerCurrent&&basis<0){basis=null;estimateStatus='ambiguous';reason='provider_used_percent_regressed';}
+      else if(providerCurrent&&total===0n){estimateStatus='no_tracked_usage';reason='no_tracked_usage';}
+      else if(providerCurrent){estimateStatus=quota.status==='stale'?'stale':'available';reason=estimateStatus==='stale'?'stale_quota_snapshot':null;}
+      base.estimate={status:estimateStatus,basisPercentagePoints:basis,semantics,basedOnObservedAt:quota.observedAt,reason};
+      const groups=historicalGroups.map((group)=>({group:{id:group.id,name:group.name},label:group.name,trackedTokens:(totals.get(group.id)??0n).toString()}));
+      groups.push({group:null,label:'Unassigned',trackedTokens:(totals.get(null)??0n).toString()});
+      base.groups=groups.map((entry)=>{const tokens=BigInt(entry.trackedTokens);return{...entry,trackedSharePercent:quotaRatioPercent(tokens,total),estimatedQuotaContributionPercentagePoints:estimateStatus==='available'||estimateStatus==='stale'?quotaContribution(basis,tokens,total):null};});
+      return base;
+    });
+    const hasCurrentCycle=windows.some((window)=>window.cycleStart!==null);
+    const quotaStatus=!hasCurrentCycle&&(quota.status==='available'||quota.status==='stale')?'unavailable':quota.status;
+    const quotaWire={observedAt:quota.observedAt,status:quotaStatus,reporterState:quota.reporterState,reporterDeviceId:quota.reporterDeviceId,errorKind:quota.errorKind,planType:quota.planType,...('sourceStatus'in quota?{sourceStatus:quota.sourceStatus}:{})};
+    return{accountId,quota:quotaWire,windows,warnings:['estimated_not_provider_attributed','untracked_usage_may_affect_estimate',...(legacyEventsPresent?['legacy_unattributed_events_exist']:[])]};
   }
 
   range(value) {

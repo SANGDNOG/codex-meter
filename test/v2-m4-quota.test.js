@@ -90,4 +90,7 @@ test('M4 server strictly rejects malformed/private quota fields and Agent report
   }finally{database.close();await rm(root,{recursive:true,force:true});}
 });
 
-test('M4 has no token-to-quota estimator in production V2',async()=>{const files=['v2/agent/app-server.js','v2/agent/sync.js','v2/server/service.js'];for(const file of files){const source=await readFile(new URL(`../${file}`,import.meta.url),'utf8');assert.doesNotMatch(source,/tokens?\s*(?:to|per)\s*quota|estimat(?:e|or).*quota/i);}});
+test('M4 has no absolute token-to-quota estimator and labels V2.1 proportional allocation as estimated',async()=>{
+  for(const file of ['v2/agent/app-server.js','v2/agent/sync.js']){const source=await readFile(new URL(`../${file}`,import.meta.url),'utf8');assert.doesNotMatch(source,/tokens?\s*(?:to|per)\s*quota|estimat(?:e|or).*quota/i);}
+  const service=await readFile(new URL('../v2/server/service.js',import.meta.url),'utf8');assert.doesNotMatch(service,/tokens?\s*(?:to|per)\s*quota/i);assert.match(service,/quotaContribution/);assert.match(service,/estimatedQuotaContributionPercentagePoints/);assert.match(service,/estimated_not_provider_attributed/);
+});

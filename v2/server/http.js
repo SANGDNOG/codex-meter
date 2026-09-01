@@ -99,6 +99,8 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
       if (method === 'POST' && path === '/api/v1/accounts') return json(response, 201, service.createAccount(await body(request)));
       match = path.match(/^\/api\/v1\/accounts\/([^/]+)\/quota\/history$/);
       if (match && method === 'GET') { const raw=url.searchParams.get('limit');const limit=raw===null?100:Number(raw);return json(response,200,service.accountQuotaHistory(decodeURIComponent(match[1]),{limit,before:url.searchParams.get('before')})); }
+      match = path.match(/^\/api\/v1\/accounts\/([^/]+)\/quota-attribution$/);
+      if (match && method === 'GET') return json(response, 200, service.quotaAttribution(decodeURIComponent(match[1])));
       match = path.match(/^\/api\/v1\/accounts\/([^/]+)$/);
       if (match && method === 'GET') return json(response, 200, service.accountDetail(decodeURIComponent(match[1]), url.searchParams.get('range') ?? 'all'));
       if (match && method === 'PATCH') return json(response, 200, service.updateAccount(decodeURIComponent(match[1]), await body(request)));
