@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdir, open, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export function safeAtom(value, maximum = 160) {
@@ -22,13 +23,26 @@ export function safeTimestamp(value) {
   return null;
 }
 export async function loadProbeSecret(filename = path.resolve('phase0-output/.probe-secret')) {
-  try { return await readFile(filename); }
+  try {
+    const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error('probe secret must be a regular file');
+      if ((info.mode & 0o077) !== 0) await handle.chmod(0o600);
+      const secret = await handle.readFile();
+      if (secret.length < 32) throw new Error('probe secret must contain at least 32 bytes');
+      return secret;
+    } finally { await handle.close(); }
+  }
   catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    if (error.code !== 'ENOENT') {
+      if (error.code === 'ELOOP') throw new Error('probe secret must be a regular file');
+      throw error;
+    }
     await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
     const secret = crypto.randomBytes(32);
     try { await writeFile(filename, secret, { mode: 0o600, flag: 'wx' }); return secret; }
-    catch (race) { if (race.code === 'EEXIST') return readFile(filename); throw race; }
+    catch (race) { if (race.code === 'EEXIST') return loadProbeSecret(filename); throw race; }
   }
 }
 export function pseudonym(value, secret) {

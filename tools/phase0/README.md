@@ -53,7 +53,19 @@ node tools/phase0/app-server-probe.js \
   --output phase0-output/app-server.json
 ```
 
-### 3. Capture the baseline rollout state
+### 3. Probe account identity structure across fresh App Server processes
+
+This probe is the V2.1 multi-account gate. It performs repeated read-only `account/read` calls, starts a fresh App Server process for every observation, and persists no raw response. It fingerprints only an explicit allowlist of non-PII identifier-shaped fields. Email and credential/token fields are never fingerprinted.
+
+```sh
+node tools/phase0/account-identity-probe.js \
+  --iterations 5 \
+  --output phase0-output/account-identity-reference.json
+```
+
+If `repeatedIdentity.status` is not `stable_candidate`, stop before production account schema, attribution, or Dashboard work. A stable candidate on one machine is still insufficient: complete A→B→A and cross-device validation before design freeze.
+
+### 4. Capture the baseline rollout state
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -66,7 +78,7 @@ node tools/phase0/accounting-analyzer.js \
   --output phase0-output/accounting-00-baseline.json
 ```
 
-### 4. Perform one controlled normal Codex turn, then inspect
+### 5. Perform one controlled normal Codex turn, then inspect
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -79,7 +91,7 @@ node tools/phase0/accounting-analyzer.js \
   --output phase0-output/accounting-01-normal.json
 ```
 
-### 5. Resume that thread, perform one controlled turn, then inspect
+### 6. Resume that thread, perform one controlled turn, then inspect
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -92,7 +104,7 @@ node tools/phase0/accounting-analyzer.js \
   --output phase0-output/accounting-02-resume.json
 ```
 
-### 6. Fork through normal Codex controls, perform one child turn, then inspect
+### 7. Fork through normal Codex controls, perform one child turn, then inspect
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -105,7 +117,7 @@ node tools/phase0/accounting-analyzer.js \
   --output phase0-output/accounting-03-fork.json
 ```
 
-### 7. Spawn a subagent through supported Codex controls, then inspect
+### 8. Spawn a subagent through supported Codex controls, then inspect
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -118,7 +130,7 @@ node tools/phase0/accounting-analyzer.js \
   --output phase0-output/accounting-04-subagent.json
 ```
 
-### 8. If safely reproducible, revert through normal Codex controls, continue once, then inspect
+### 9. If safely reproducible, revert through normal Codex controls, continue once, then inspect
 
 ```sh
 node tools/phase0/rollout-inspector.js \
@@ -133,7 +145,7 @@ node tools/phase0/accounting-analyzer.js \
 
 Do not edit or corrupt rollouts to manufacture a revert. Current Codex can preserve a logical thread ID while creating a different physical rollout with a history cutoff. The analyzer uses explicit history/lineage evidence to avoid counting inherited history twice; if reconstruction is not reliable, it reports `ambiguous` rather than guessing.
 
-### 9. Compare a second-device quota snapshot
+### 10. Compare a second-device quota snapshot
 
 On the first machine:
 
@@ -160,7 +172,7 @@ node tools/phase0/quota-snapshot.js \
 
 Windows are matched by stable observable properties such as opaque `limitId` plus actual `windowDurationMins`; `primary`/`secondary` are only observed slots and may reorder. Duplicate candidate identities are ambiguous. Matching percentages, resets, plan metadata, and window identities do **not** prove globally shared scope: time drift, quantization, intervening activity, workspace selection, credits, resets, spend controls, and provider reconfiguration can confound the result.
 
-### 10. Record a controlled quota-calibration observation
+### 11. Record a controlled quota-calibration observation
 
 Ensure other devices and Codex Web/Work/IDE activity are idle. Keep model, reasoning effort, and service/speed tier fixed, choose a quota window far from reset, and do not span a reset.
 

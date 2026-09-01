@@ -37,11 +37,28 @@ export class AppServerClient {
   }
   rejectAll(error) { for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(error); } this.pending.clear(); }
   async close() {
-    if (!this.child) return;
-    this.child.stdin.end();
-    if (this.child.exitCode == null) this.child.kill('SIGTERM');
-    await new Promise((resolve) => { if (this.child.exitCode != null) resolve(); else { this.child.once('exit', resolve); setTimeout(resolve, 1000).unref(); } });
+    if (!this.child) return { exited: true, forced: false };
+    const child = this.child; this.child = null;
+    child.stdin.end();
+    if (child.exitCode != null || child.signalCode != null) return { exited: true, forced: false };
+    child.kill('SIGTERM');
+    if (await waitForExit(child, 1000)) return { exited: true, forced: false };
+    child.kill('SIGKILL');
+    const exited = await waitForExit(child, 1000);
+    if (!exited) throw new Error('App Server process exit could not be confirmed');
+    return { exited: true, forced: true };
   }
+}
+
+function waitForExit(child, timeoutMs) {
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let done = false; let timer;
+    const finish = (value) => { if (done) return; done = true; clearTimeout(timer); child.removeListener('exit', onExit); resolve(value); };
+    const onExit = () => finish(true);
+    child.once('exit', onExit);
+    timer = setTimeout(() => finish(child.exitCode != null || child.signalCode != null), timeoutMs);
+  });
 }
 function safeError(error) {
   const code = Number.isSafeInteger(error?.code) ? error.code : null;

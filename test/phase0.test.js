@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { inspectRollouts } from '../tools/phase0/shared/rollout.js';
 import { analyzeAccounting, buildLineage } from '../tools/phase0/shared/accounting.js';
 import { streamJsonl } from '../tools/phase0/shared/jsonl.js';
 import { AppServerClient, normalizeAccount, normalizeRateLimits } from '../tools/phase0/shared/app-server-client.js';
+import { sanitizeAccountIdentity, assessRepeatedIdentity } from '../tools/phase0/account-identity-probe.js';
+import { loadProbeSecret } from '../tools/phase0/shared/sanitize.js';
 import { compareSnapshots } from '../tools/phase0/quota-snapshot.js';
 import { calibrationInterval, finishObservation } from '../tools/phase0/calibration-recorder.js';
 import { addTokens, subtractTokens } from '../tools/phase0/shared/core.js';
@@ -176,4 +178,72 @@ test('phase0 unavailable cumulative observations are explicitly ambiguous', () =
   assert.equal(result.strategies.lineageAware.quality, 'ambiguous');
   assert.equal(result.strategies.lineageAware.totalTokens, null);
   assert.match(result.ambiguous.join('\n'), /no cumulative token observations/);
+});
+
+test('phase0 account identity sanitizer fingerprints only explicit non-PII ID fields', () => {
+  const raw = { account: {
+    type: 'chatgpt', planType: 'pro', email: 'private@example.com', accessToken: 'secret-token',
+    accountId: 'acct_0123456789abcdef', profile: { id: 'nested-private', displayName: 'Private Name' }
+  }, requestId: 'request-private' };
+  const result = sanitizeAccountIdentity(raw, secret);
+  assert.deepEqual(result.account, { authType: 'chatgpt', planType: 'pro' });
+  assert.deepEqual(result.accountFieldSchema.map((x) => [x.name, x.type]), [
+    ['accessToken', 'string'], ['accountId', 'string'], ['email', 'string'], ['planType', 'string'], ['profile', 'object'], ['type', 'string']
+  ]);
+  assert.equal(result.candidates.length, 1);
+  assert.deepEqual(Object.keys(result.candidates[0]).sort(), ['fingerprint', 'namespace', 'path']);
+  assert.equal(result.candidates[0].namespace, 'accountId');
+  const text = JSON.stringify(result);
+  for (const forbidden of ['private@example.com', 'secret-token', 'acct_0123456789abcdef', 'nested-private', 'Private Name', 'request-private']) assert.equal(text.includes(forbidden), false, forbidden);
+});
+
+test('phase0 account identity sanitizer refuses email, token-like, malformed, and ambiguous candidates', () => {
+  const emailOnly = sanitizeAccountIdentity({ account: { type: 'chatgpt', email: 'a@example.com', id: 'a@example.com' } }, secret);
+  assert.equal(emailOnly.candidates.length, 0); assert.equal(emailOnly.status, 'no_safe_candidate');
+  const tokenNamed = sanitizeAccountIdentity({ account: { accessToken: 'opaque_0123456789abcdef', refresh_token: 'opaque_abcdef0123456789' } }, secret);
+  assert.equal(tokenNamed.candidates.length, 0);
+  const ambiguous = sanitizeAccountIdentity({ account: { accountId: 'acct_0123456789abcdef', workspaceId: 'ws_0123456789abcdef' } }, secret);
+  assert.equal(ambiguous.candidates.length, 2); assert.equal(ambiguous.status, 'ambiguous_candidates');
+  assert.equal(sanitizeAccountIdentity(null, secret).status, 'malformed_response');
+});
+
+test('phase0 repeated identity assessment requires one stable namespace and fingerprint', () => {
+  const one = sanitizeAccountIdentity({ account: { accountId: 'acct_0123456789abcdef' } }, secret);
+  const same = sanitizeAccountIdentity({ account: { accountId: 'acct_0123456789abcdef' } }, secret);
+  const changed = sanitizeAccountIdentity({ account: { accountId: 'acct_fedcba9876543210' } }, secret);
+  assert.deepEqual(assessRepeatedIdentity([one, same]), { status: 'stable_candidate', namespace: 'accountId', fingerprint: one.candidates[0].fingerprint, observations: 2 });
+  assert.equal(assessRepeatedIdentity([one, changed]).status, 'unstable_candidate');
+  assert.equal(assessRepeatedIdentity([sanitizeAccountIdentity({ account: { email: 'a@example.com' } }, secret)]).status, 'no_safe_candidate');
+});
+
+test('phase0 account labels use strict low-cardinality allowlists and never emit arbitrary provider strings', () => {
+  const result = sanitizeAccountIdentity({ account: { type: 'person@example.com', planType: 'eyJhbGciOiJIUzI1NiJ9.payload.signature' } }, secret);
+  assert.deepEqual(result.account, { authType: null, planType: null });
+  assert.equal(JSON.stringify(result).includes('person@example.com'), false);
+  assert.equal(JSON.stringify(result).includes('eyJhbGci'), false);
+});
+
+test('phase0 repeated identity keeps request failures and mixed observations explicit', () => {
+  const failed = { status: 'request_failed', candidates: [] };
+  const noCandidate = sanitizeAccountIdentity({ account: { email: 'a@example.com' } }, secret);
+  assert.equal(assessRepeatedIdentity([failed, failed]).status, 'request_failed');
+  assert.equal(assessRepeatedIdentity([noCandidate, failed]).status, 'incomplete_observations');
+});
+
+test('phase0 App Server close escalates to kill and confirms process exit', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'phase0-stubborn-server-')); const executable = path.join(root, 'fake-server');
+  await writeFile(executable, `#!/usr/bin/env node\nconst rl=require('node:readline').createInterface({input:process.stdin});process.on('SIGTERM',()=>{});setInterval(()=>{},1000);rl.on('line',line=>{const x=JSON.parse(line);if(x.method==='initialize')process.stdout.write(JSON.stringify({id:x.id,result:{}})+'\\n')})\n`); await chmod(executable, 0o700);
+  const client = new AppServerClient({ command: executable, timeoutMs: 2000 });
+  await client.start(); const child = client.child; const lifecycle = await client.close();
+  assert.equal(lifecycle.exited, true); assert.equal(lifecycle.forced, true);
+  assert.notEqual(child.signalCode, null);
+});
+
+test('phase0 existing probe secret permissions are tightened and symlinks rejected', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'phase0-secret-')); const file = path.join(root, 'secret');
+  await writeFile(file, Buffer.alloc(32, 9), { mode: 0o644 });
+  await loadProbeSecret(file);
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+  const link = path.join(root, 'link'); await symlink(file, link);
+  await assert.rejects(() => loadProbeSecret(link), /regular file/i);
 });
