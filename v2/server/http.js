@@ -95,6 +95,14 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
       let match = path.match(/^\/api\/v1\/groups\/([^/]+)$/);
       if (match && method === 'PATCH') return json(response, 200, service.updateGroup(decodeURIComponent(match[1]), await body(request)));
       if (match && method === 'DELETE') return json(response, 200, service.updateGroup(decodeURIComponent(match[1]), { archived: true }));
+      if (method === 'GET' && path === '/api/v1/accounts') return json(response, 200, { accounts: service.listAccounts(url.searchParams.get('range') ?? 'all') });
+      if (method === 'POST' && path === '/api/v1/accounts') return json(response, 201, service.createAccount(await body(request)));
+      match = path.match(/^\/api\/v1\/accounts\/([^/]+)\/quota\/history$/);
+      if (match && method === 'GET') { const raw=url.searchParams.get('limit');const limit=raw===null?100:Number(raw);return json(response,200,service.accountQuotaHistory(decodeURIComponent(match[1]),{limit,before:url.searchParams.get('before')})); }
+      match = path.match(/^\/api\/v1\/accounts\/([^/]+)$/);
+      if (match && method === 'GET') return json(response, 200, service.accountDetail(decodeURIComponent(match[1]), url.searchParams.get('range') ?? 'all'));
+      if (match && method === 'PATCH') return json(response, 200, service.updateAccount(decodeURIComponent(match[1]), await body(request)));
+      if (match && method === 'DELETE') return json(response, 200, service.updateAccount(decodeURIComponent(match[1]), { archived: true }));
       if (method === 'GET' && path === '/api/v1/devices') return json(response, 200, { devices: service.listDevices() });
       if (method === 'POST' && path === '/api/v1/devices') return json(response, 201, service.createDevice(await body(request)));
       match = path.match(/^\/api\/v1\/device-enrollments\/([^/]+)$/);
@@ -103,6 +111,10 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
       if (match && method === 'GET') return json(response, 200, service.deviceDetail(decodeURIComponent(match[1])));
       if (match && method === 'PATCH') return json(response, 200, service.updateDevice(decodeURIComponent(match[1]), await body(request)));
       if (match && method === 'DELETE') { service.removeDevice(decodeURIComponent(match[1])); return json(response, 200, { removed: true }); }
+      match = path.match(/^\/api\/v1\/devices\/([^/]+)\/account-bindings$/);
+      if (match && method === 'POST') return json(response, 201, service.bindAccount(decodeURIComponent(match[1]), await body(request)));
+      match = path.match(/^\/api\/v1\/devices\/([^/]+)\/account-bindings\/([^/]+)$/);
+      if (match && method === 'DELETE') return json(response, 200, service.disableBinding(decodeURIComponent(match[1]), decodeURIComponent(match[2])));
       match = path.match(/^\/api\/v1\/devices\/([^/]+)\/(move|disable|rotate)$/);
       if (match && method === 'POST') {
         const deviceId = decodeURIComponent(match[1]);

@@ -54,46 +54,51 @@ function putCursor(database, descriptor, values) {
 }
 
 export class AgentCollector {
-  constructor(database, { home, discovery = discoverRollouts, clock = Date.now } = {}) {
-    this.database = database; this.home = home; this.discovery = discovery; this.clock = clock;
+  constructor(database, { home, accountId = null, bindingKey = accountId, discovery = discoverRollouts, clock = Date.now } = {}) {
+    this.database = database; this.home = home; this.accountId = accountId; this.bindingKey = bindingKey; this.discovery = discovery; this.clock = clock;
   }
+
+  identity(value) { return this.bindingKey ? `${this.bindingKey}\0${value}` : value; }
+  baselineKey() { return this.bindingKey ? `installation_baselined:${hash(this.bindingKey)}` : 'installation_baselined'; }
 
   async reconcile() {
     const discovery = await this.discovery({ home: this.home });
-    const installed = this.database.prepare("SELECT value FROM agent_state WHERE key='installation_baselined'").get();
+    const baselineKey = this.baselineKey();
+    const installed = this.database.prepare('SELECT value FROM agent_state WHERE key=?').get(baselineKey);
     if (!installed) {
       const baselines = [];
       for (const file of discovery.files) {
         try { baselines.push([file, await safeBaseline(file.path)]); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
       transaction(this.database, () => {
-        if (!this.database.prepare("SELECT 1 FROM agent_state WHERE key='installation_baselined'").get()) {
-          for (const [file, base] of baselines) putCursor(this.database, file, { ...base, classification: 'baseline' });
+        if (!this.database.prepare('SELECT 1 FROM agent_state WHERE key=?').get(baselineKey)) {
+          for (const [file, base] of baselines) putCursor(this.database, { ...file, physicalIdentity: this.identity(file.physicalIdentity) }, { ...base, classification: 'baseline' });
           const timestamp = new Date(this.clock()).toISOString();
           for (const file of discovery.compressedFiles ?? []) this.database.prepare('INSERT OR IGNORE INTO agent_state(key,value,updated_at) VALUES(?,?,?)')
-            .run(`compressed_baseline:${hash(file.physicalIdentity)}`, '1', timestamp);
-          this.database.prepare("INSERT INTO agent_state(key,value,updated_at) VALUES('installation_baselined',?,?)").run(timestamp, timestamp);
+            .run(`compressed_baseline:${hash(this.identity(file.physicalIdentity))}`, '1', timestamp);
+          this.database.prepare('INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)').run(baselineKey, timestamp, timestamp);
         }
       });
       return { baseline: baselines.length, events: 0, files: discovery.files.length, compressedOnly: discovery.compressedOnly };
     }
     const compressedAt = new Date(this.clock()).toISOString();
     for (const file of discovery.compressedFiles ?? []) this.database.prepare('INSERT OR IGNORE INTO agent_state(key,value,updated_at) VALUES(?,?,?)')
-      .run(`compressed_baseline:${hash(file.physicalIdentity)}`, '1', compressedAt);
+      .run(`compressed_baseline:${hash(this.identity(file.physicalIdentity))}`, '1', compressedAt);
     let events = 0;
     for (const file of discovery.files) events += await this.collectFile(file);
     return { baseline: 0, events, files: discovery.files.length, compressedOnly: discovery.compressedOnly };
   }
 
   async collectFile(descriptor) {
-    const rolloutKey = hash(descriptor.physicalIdentity);
+    const scopedDescriptor = { ...descriptor, physicalIdentity: this.identity(descriptor.physicalIdentity) };
+    const rolloutKey = hash(scopedDescriptor.physicalIdentity);
     let current = cursor(this.database, rolloutKey);
     if (!current) {
-      const compressedKey = `compressed_baseline:${hash(descriptor.physicalIdentity)}`;
+      const compressedKey = `compressed_baseline:${hash(scopedDescriptor.physicalIdentity)}`;
       if (this.database.prepare('SELECT 1 FROM agent_state WHERE key=?').get(compressedKey)) {
         const base = await safeBaseline(descriptor.path);
         transaction(this.database, () => {
-          putCursor(this.database, descriptor, { ...base, classification: 'ambiguous' });
+          putCursor(this.database, scopedDescriptor, { ...base, classification: 'ambiguous' });
           this.database.prepare('DELETE FROM agent_state WHERE key=?').run(compressedKey);
         });
         return 0;
@@ -102,7 +107,7 @@ export class AgentCollector {
       const classification = classifyRollout(probe.lines.map(({ record }) => record));
       if (classification !== 'root') {
         const base = await safeBaseline(descriptor.path);
-        transaction(this.database, () => putCursor(this.database, descriptor, { ...base, classification }));
+        transaction(this.database, () => putCursor(this.database, scopedDescriptor, { ...base, classification }));
         return 0;
       }
       current = { byte_offset: 0, discard_until_newline: 0, classification, model: null, reasoning_effort: null };
@@ -111,7 +116,7 @@ export class AgentCollector {
     try { size = (await stat(descriptor.path)).size; } catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
     if (BigInt(current.byte_offset) > BigInt(size)) {
       const base = await safeBaseline(descriptor.path);
-      transaction(this.database, () => putCursor(this.database, descriptor, { ...base, classification: 'ambiguous' }));
+      transaction(this.database, () => putCursor(this.database, scopedDescriptor, { ...base, classification: 'ambiguous' }));
       return 0;
     }
     const parsed = await readCompleteLines(descriptor.path, Number(current.byte_offset), {
@@ -122,7 +127,7 @@ export class AgentCollector {
     const additions = [];
     for (const line of parsed.lines) {
       const event = parser.parse(line.record);
-      if (event) additions.push({ event, id: hash(`${descriptor.physicalIdentity}\0${line.start}\0${line.end}\0${JSON.stringify(event)}`) });
+      if (event) additions.push({ event, id: hash(`${scopedDescriptor.physicalIdentity}\0${line.start}\0${line.end}\0${JSON.stringify(event)}`) });
     }
     const finalContext = parser.context();
     transaction(this.database, () => {
@@ -131,12 +136,12 @@ export class AgentCollector {
       const expected = BigInt(current.byte_offset);
       if (latest && BigInt(latest.byte_offset) !== expected) return;
       for (const { event, id } of additions) this.database.prepare(`INSERT OR IGNORE INTO usage_outbox
-        (event_id,occurred_at,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,model,reasoning_effort,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id, event.occurredAt, event.inputTokens == null ? null : parseUnsignedInt64(event.inputTokens),
+        (event_id,occurred_at,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,model,reasoning_effort,created_at,account_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, event.occurredAt, event.inputTokens == null ? null : parseUnsignedInt64(event.inputTokens),
           event.cachedInputTokens == null ? null : parseUnsignedInt64(event.cachedInputTokens), event.cacheWriteInputTokens == null ? null : parseUnsignedInt64(event.cacheWriteInputTokens),
           event.outputTokens == null ? null : parseUnsignedInt64(event.outputTokens), event.reasoningOutputTokens == null ? null : parseUnsignedInt64(event.reasoningOutputTokens),
-          parseUnsignedInt64(event.totalTokens), event.model, event.reasoningEffort, new Date(this.clock()).toISOString());
-      putCursor(this.database, descriptor, { offset: parsed.nextOffset, discardUntilNewline: parsed.discardUntilNewline,
+          parseUnsignedInt64(event.totalTokens), event.model, event.reasoningEffort, new Date(this.clock()).toISOString(), this.accountId);
+      putCursor(this.database, scopedDescriptor, { offset: parsed.nextOffset, discardUntilNewline: parsed.discardUntilNewline,
         classification: current.classification, model: finalContext.model, reasoningEffort: finalContext.reasoningEffort, malformedLines: parsed.malformedLines,
         oversizedLines: parsed.oversizedLines, partialLines: parsed.partialLines });
     });

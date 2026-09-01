@@ -1,0 +1,5 @@
+-- Safe, classified quota diagnostics. Nullable columns preserve all legacy rows.
+ALTER TABLE quota_current ADD COLUMN error_kind TEXT CHECK (error_kind IS NULL OR error_kind IN ('codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits'));
+ALTER TABLE quota_snapshots ADD COLUMN error_kind TEXT CHECK (error_kind IS NULL OR error_kind IN ('codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits'));
+ALTER TABLE account_quota_current ADD COLUMN error_kind TEXT CHECK (error_kind IS NULL OR error_kind IN ('codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits'));
+ALTER TABLE account_quota_snapshots ADD COLUMN error_kind TEXT CHECK (error_kind IS NULL OR error_kind IN ('codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits'));

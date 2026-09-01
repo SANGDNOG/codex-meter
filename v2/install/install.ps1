@@ -47,6 +47,8 @@ try {
   if ($Actual -ne $Artifact.sha256.ToLowerInvariant()) { Fail 'artifact checksum mismatch; existing installation was not changed' }
 
   $EnrollArgs = @('enroll', '--server', $ServerUrl, '--token', $EnrollmentToken, '--config', $Config)
+  $CodexCommand = Get-Command codex -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (($null -ne $CodexCommand) -and [System.IO.Path]::IsPathRooted($CodexCommand.Source)) { $EnrollArgs += @('--codex-executable', $CodexCommand.Source) }
   if ($env:CODEX_METER_ALLOW_HTTP_TESTS -eq '1') { $EnrollArgs += '--allow-http-for-tests' }
   & $Candidate @EnrollArgs
   if ($LASTEXITCODE -ne 0) { Fail 'enrollment failed; existing executable was not changed' }

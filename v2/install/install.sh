@@ -64,11 +64,19 @@ else
 fi
 [ "$ACTUAL" = "$EXPECTED" ] || fail 'artifact checksum mismatch; existing installation was not changed'
 chmod 700 "$CANDIDATE"
+# Capture Codex from the interactive install environment; services intentionally do not receive a broad PATH.
+CODEX_EXECUTABLE=''
+CODEX_CANDIDATE=$(command -v codex 2>/dev/null || true)
+case "$CODEX_CANDIDATE" in /*) [ -x "$CODEX_CANDIDATE" ] && CODEX_EXECUTABLE=$CODEX_CANDIDATE ;; esac
+CODEX_ARGS=''
+[ -z "$CODEX_EXECUTABLE" ] || CODEX_ARGS=1
 # Enroll with the verified candidate before replacing an existing working executable.
 if [ "${CODEX_METER_ALLOW_HTTP_TESTS:-0}" = 1 ]; then
-  "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG" --allow-http-for-tests || fail 'enrollment failed; existing executable was not changed'
+  if [ -n "$CODEX_ARGS" ]; then "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG" --codex-executable "$CODEX_EXECUTABLE" --allow-http-for-tests;
+  else "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG" --allow-http-for-tests; fi || fail 'enrollment failed; existing executable was not changed'
 else
-  "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG" || fail 'enrollment failed; existing executable was not changed'
+  if [ -n "$CODEX_ARGS" ]; then "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG" --codex-executable "$CODEX_EXECUTABLE";
+  else "$CANDIDATE" enroll --server "$SERVER_URL" --token "$TOKEN" --config "$CONFIG"; fi || fail 'enrollment failed; existing executable was not changed'
 fi
 chmod 600 "$CONFIG"
 mv -f "$CANDIDATE" "$BIN"

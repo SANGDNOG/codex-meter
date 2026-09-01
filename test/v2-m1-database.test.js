@@ -54,7 +54,8 @@ test('server migration creates the complete M1 schema and indexes', async () => 
   await withDatabase('server', async (database) => {
     const tables = database.prepare(`SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all().map(({ name }) => name);
     assert.deepEqual(tables, [
-      'admin_auth', 'admin_sessions', 'device_enrollments', 'device_group_memberships', 'devices', 'groups', 'quota_current',
+      'account_quota_current', 'account_quota_snapshots', 'accounts', 'admin_auth', 'admin_sessions', 'device_account_bindings',
+      'device_enrollments', 'device_group_memberships', 'devices', 'groups', 'quota_current',
       'quota_snapshots', 'schema_migrations', 'server_settings', 'usage_adjustments', 'usage_events'
     ]);
     const indexes = database.prepare(`SELECT name FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name`).all().map(({ name }) => name);
@@ -80,7 +81,7 @@ test('server foreign keys are enforced and migrations remain idempotent', async 
     database = null;
     const reopened = openServerDatabase(filename);
     try {
-      assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM schema_migrations').count, 4);
+      assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM schema_migrations').count, 6);
       assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM groups').count, 1);
       assert.equal(scalar(reopened, 'PRAGMA foreign_keys').foreign_keys, 1);
     } finally { reopened.close(); }

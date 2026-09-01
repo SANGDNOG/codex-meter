@@ -11,6 +11,7 @@ function outboxRows(database, limit) {
 }
 function wire(row) {
   const event = { eventId: row.event_id, occurredAt: row.occurred_at, model: row.model, reasoningEffort: row.reasoning_effort };
+  if (row.account_id !== null) event.accountId = row.account_id;
   for (let i = 0; i < COLUMNS.length; i++) event[WIRE[i]] = row[COLUMNS[i]] == null ? null : row[COLUMNS[i]].toString();
   return event;
 }
@@ -19,18 +20,35 @@ function state(database, key, value, clock) {
   database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(key, String(value), at);
 }
+function profileQuotaState(database, report, clock) {
+  const attemptedAt = new Date(clock()).toISOString();
+  database.prepare(`INSERT INTO profile_quota_status(account_id,status,error_kind,attempted_at) VALUES(?,?,?,?)
+    ON CONFLICT(account_id) DO UPDATE SET status=excluded.status,error_kind=excluded.error_kind,attempted_at=excluded.attempted_at`)
+    .run(report.accountId, report.status, report.errorKind ?? null, attemptedAt);
+}
 
 export class AgentSyncClient {
   constructor(database, config, { fetchImpl = fetch, clock = Date.now, codexVersion = null, timeoutMs = 30_000, quotaReporter } = {}) {
     this.database = database; this.config = config; this.fetch = fetchImpl; this.clock = clock; this.codexVersion = codexVersion; this.timeoutMs = timeoutMs;
-    this.quotaReporter = quotaReporter ?? new QuotaReporter({ clock });
+    this.quotaReporter = (config.profiles ?? []).length ? null : (quotaReporter ?? new QuotaReporter({ clock, command: config.codexExecutable ?? 'codex', codexHome: config.codexHome }));
+    this.profileQuotaReporters = (config.profiles ?? []).map((profile) => new QuotaReporter({ clock, accountId: profile.accountId,
+      codexHome: profile.codexHome, command: profile.codexExecutable ?? config.codexExecutable ?? 'codex' }));
   }
   pending() { return this.database.prepare('SELECT COUNT(*) count FROM usage_outbox').get().count; }
   async sync({ heartbeat = false, health = { status: 'healthy' } } = {}) {
     const rows = outboxRows(this.database, this.config.maxBatchSize);
     const designated = this.database.prepare("SELECT value FROM agent_state WHERE key='is_quota_reporter'").get()?.value === 'true';
     if (!rows.length && !heartbeat && !designated) return { skipped: true, pending: 0 };
-    const quotaReport = designated ? await this.quotaReporter.observe() : undefined;
+    const quotaReport = designated && this.quotaReporter ? await this.quotaReporter.observe() : undefined;
+    const quotaReports = heartbeat && this.profileQuotaReporters.length ? await Promise.all(this.profileQuotaReporters.map((reporter) => reporter.observe())) : undefined;
+    const attempted = [...(quotaReport ? [quotaReport] : []), ...(quotaReports ?? [])];
+    if (attempted.length) {
+      state(this.database, 'last_quota_attempt_at', new Date(this.clock()).toISOString(), this.clock);
+      const failed=attempted.find((report)=>report.status!=='available');
+      state(this.database, 'last_quota_status', failed?.status ?? 'available', this.clock);
+      state(this.database, 'last_quota_error_kind', failed?.errorKind ?? '', this.clock);
+      for (const report of quotaReports ?? []) profileQuotaState(this.database, report, this.clock);
+    }
     const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let response;
     try {
@@ -38,7 +56,7 @@ export class AgentSyncClient {
         method: 'POST', signal: controller.signal,
         headers: { 'content-type': 'application/json', authorization: `Bearer ${this.config.deviceId}.${this.config.deviceSecret}` },
         body: JSON.stringify({ agentVersion: AGENT_VERSION, codexVersion: this.codexVersion, events: rows.map(wire), health,
-          ...(quotaReport === undefined ? {} : { quotaReport }) })
+          ...(quotaReport === undefined ? {} : { quotaReport }), ...(quotaReports === undefined ? {} : { quotaReports }) })
       });
     } catch (error) {
       state(this.database, 'last_sync_status', 'unavailable', this.clock);
@@ -54,17 +72,28 @@ export class AgentSyncClient {
     const sent = new Set(rows.map((row) => row.event_id));
     const acknowledged = new Set([...(Array.isArray(result.acceptedEventIds) ? result.acceptedEventIds : []),
       ...(Array.isArray(result.duplicateEventIds) ? result.duplicateEventIds : [])].filter((id) => sent.has(id)));
+    const permanentlyRejected = new Map();
+    if (Array.isArray(result.rejectedEvents)) for (const rejection of result.rejectedEvents) {
+      if (!rejection || typeof rejection !== 'object' || Array.isArray(rejection) || Object.keys(rejection).sort().join(',') !== 'eventId,reason') continue;
+      if (rejection.reason === 'account_not_bound' && sent.has(rejection.eventId) && !acknowledged.has(rejection.eventId))
+        permanentlyRejected.set(rejection.eventId, rejection.reason);
+    }
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const remove = this.database.prepare('DELETE FROM usage_outbox WHERE event_id=?');
       for (const id of acknowledged) remove.run(id);
+      const deadLetter = this.database.prepare('INSERT OR IGNORE INTO usage_dead_letters(event_id,account_id,reason,rejected_at) SELECT event_id,account_id,?,? FROM usage_outbox WHERE event_id=?');
+      for (const [eventId, reason] of permanentlyRejected) {
+        deadLetter.run(reason, new Date(this.clock()).toISOString(), eventId);
+        remove.run(eventId);
+      }
       state(this.database, 'last_sync_status', 'ok', this.clock);
       state(this.database, 'last_sync_at', new Date(this.clock()).toISOString(), this.clock);
       if (result.serverTime) state(this.database, 'last_server_time', result.serverTime, this.clock);
       state(this.database, 'is_quota_reporter', result.isQuotaReporter === true, this.clock);
       this.database.exec('COMMIT');
     } catch (error) { this.database.exec('ROLLBACK'); throw error; }
-    return { sent: rows.length, acknowledged: acknowledged.size, pending: this.pending(), configuration: result.agentConfiguration ?? null,
+    return { sent: rows.length, acknowledged: acknowledged.size, rejected: permanentlyRejected.size, pending: this.pending(), configuration: result.agentConfiguration ?? null,
       isQuotaReporter: result.isQuotaReporter === true };
   }
 }

@@ -1,21 +1,52 @@
 import { chmod } from 'node:fs/promises';
-import { AGENT_VERSION, defaultConfigPath, enroll, loadConfig } from './config.js';
+import path from 'node:path';
+import { AGENT_VERSION, defaultConfigPath, enroll, initializeManagedHome, loadConfig, profileLauncher, saveConfig, validateConfig } from './config.js';
 import { openAgentDatabase } from './database.js';
-import { AgentRuntime, agentStatus } from './runtime.js';
+import { AgentRuntime, agentStatus, assertProfilesCanonicalDisjoint, bindProfileHome, canonicalHome } from './runtime.js';
+import { AgentCollector } from './collector.js';
 import { lifecyclePaths, serviceStatus, uninstallInstalledAgent, updateInstalledAgent } from './lifecycle.js';
 
 function option(args, name) { const index = args.indexOf(name); return index < 0 ? null : args[index + 1]; }
-function usage() { return 'usage: codex-meter-agent <run|enroll|status|update|uninstall|version>'; }
+function usage() { return 'usage: codex-meter-agent <run|enroll|status|profile-add|profile-launcher|update|uninstall|version>'; }
 export async function runAgentCli(args = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr } = {}) {
   const command = args[0]; const configPath = option(args, '--config') || defaultConfigPath();
   if (command === 'version' || command === '--version') { stdout.write(`${AGENT_VERSION}\n`); return 0; }
   if (command === 'enroll') {
     const serverUrl = option(args, '--server'); const token = option(args, '--token');
     if (!serverUrl || !token) throw new Error('enroll requires --server and --token');
-    await enroll({ serverUrl, token, configPath, allowHttpForTests: args.includes('--allow-http-for-tests'), codexHome: option(args, '--codex-home') || undefined });
+    await enroll({ serverUrl, token, configPath, allowHttpForTests: args.includes('--allow-http-for-tests'), codexHome: option(args, '--codex-home') || undefined,
+      codexExecutable: option(args, '--codex-executable') || undefined });
     stdout.write('enrolled\n'); return 0;
   }
   const config = await loadConfig(configPath);
+  if (command === 'profile-add') {
+    const accountId=option(args,'--account');const name=option(args,'--name');const codexHome=option(args,'--codex-home');const codexExecutable=option(args,'--codex-executable');
+    if(!accountId||!name||!codexHome)throw new Error('profile-add requires --account, --name, and --codex-home');
+    const candidate=validateConfig({...config,profiles:[...config.profiles,{accountId,name,codexHome,...(codexExecutable?{codexExecutable}:{})}]});
+    await assertProfilesCanonicalDisjoint(candidate.profiles);
+    let database=openAgentDatabase(config.databasePath);
+    try {
+      const running=database.prepare("SELECT value FROM agent_state WHERE key='runtime_status'").get()?.value==='running';
+      const legacyRoot=await canonicalHome(config.codexHome),profileRoot=await canonicalHome(codexHome);
+      const comparable=(value)=>process.platform==='win32'?value.toLowerCase():value;
+      const legacyComparable=comparable(legacyRoot),profileComparable=comparable(profileRoot);
+      if(running&&(legacyComparable===profileComparable||legacyComparable.startsWith(`${profileComparable}${path.sep}`)||profileComparable.startsWith(`${legacyComparable}${path.sep}`)))
+        throw new Error('stop the running Agent before adopting its legacy CODEX_HOME as a profile');
+    }
+    finally { database.close(); }
+    await initializeManagedHome(candidate.profiles.find((profile)=>profile.accountId===accountId).codexHome,accountId);
+    // Establish the installation baseline before exposing the launcher/config.
+    database=openAgentDatabase(config.databasePath);
+    try { await bindProfileHome(database,{accountId,codexHome}); await new AgentCollector(database,{home:codexHome,accountId}).reconcile(); }
+    finally { database.close(); }
+    await saveConfig(configPath,candidate);
+    stdout.write(`profile added: ${accountId}\n`);return 0;
+  }
+  if (command === 'profile-launcher') {
+    const accountId=option(args,'--account');const profile=config.profiles.find((item)=>item.accountId===accountId);
+    if(!profile)throw new Error('profile-launcher requires a configured --account');
+    stdout.write(profileLauncher({...profile,codexExecutable:profile.codexExecutable??config.codexExecutable}));return 0;
+  }
   if (command === 'status') {
     const database = openAgentDatabase(config.databasePath); try { stdout.write(`${JSON.stringify({ ...agentStatus(database, config), ...await serviceStatus(lifecyclePaths()) }, null, 2)}\n`); } finally { database.close(); } return 0;
   }

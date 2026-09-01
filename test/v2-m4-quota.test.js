@@ -23,35 +23,34 @@ const normalFake = `const fs=require('node:fs');const readline=require('node:rea
 test('M4 App Server performs bounded correlated handshake and only fixed read-only operations', async()=>fakeAppServer(normalFake,async({executable,calls})=>{
   const previous=process.env.CALLS;process.env.CALLS=calls;
   try{const reporter=new QuotaReporter({command:executable,timeoutMs:2000,clock:()=>NOW});const result=await reporter.observe();assert.equal(result.status,'available');assert.deepEqual(result.windows.map(x=>[x.limitId,x.durationMinutes]),[['codex',300],['codex',10080]]);assert.equal(JSON.stringify(result).includes('PRIVATE'),false);
-    const sent=(await readFile(calls,'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(sent.map(x=>x.method),['initialize','initialized','account/read','account/rateLimits/read']);assert.deepEqual(sent[2].params,{refreshToken:false});assert.equal(sent[0].id+1,sent[2].id);assert.equal(sent[3].id,sent[2].id+1);assert.ok(sent.every(x=>!String(x.method).includes('consume')&&!String(x.method).includes('reset')));
+    const sent=(await readFile(calls,'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(sent.map(x=>x.method),['initialize','initialized','account/read','account/rateLimits/read']);assert.equal(sent[0].id+1,sent[2].id);assert.deepEqual(sent[2].params,{refreshToken:false});assert.ok(sent.every(x=>!String(x.method).includes('login')&&!String(x.method).includes('logout')&&!String(x.method).includes('consume')&&!String(x.method).includes('reset')));
     assert.equal(typeof ReadOnlyAppServerClient.prototype.request,'undefined');
   }finally{if(previous===undefined)delete process.env.CALLS;else process.env.CALLS=previous;}
 }));
 
 test('M4 App Server ignores malformed, oversized, notifications, wrong IDs and never leaks raw stderr/response',async()=>fakeAppServer(`const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);process.stderr.write('STDERR_PRIVATE');if(x.method==='initialized')return;if(x.method==='initialize')return process.stdout.write(JSON.stringify({id:x.id,result:{}})+'\\n');process.stdout.write('{bad\\n');process.stdout.write(JSON.stringify({noise:'X'.repeat(2000)})+'\\n');process.stdout.write(JSON.stringify({id:999,result:{prompt:'RESPONSE_PRIVATE'}})+'\\n');if(x.method==='account/read')return process.stdout.write(JSON.stringify({id:x.id,result:{account:{planType:'unknown-secret-plan'}}})+'\\n');process.stdout.write(JSON.stringify({id:x.id,result:{rateLimits:{limitId:'codex',primary:{windowDurationMins:'bad',usedPercent:1,prompt:'PRIVATE'}}}})+'\\n')})`,async({executable})=>{
-  const report=await new QuotaReporter({command:executable,timeoutMs:2000,maxLineBytes:1024,clock:()=>NOW}).observe();assert.deepEqual(report,{observedAt:new Date(NOW).toISOString(),status:'unavailable',planType:null,windows:[]});assert.equal(JSON.stringify(report).includes('PRIVATE'),false);
+  const report=await new QuotaReporter({command:executable,timeoutMs:2000,maxLineBytes:1024,clock:()=>NOW}).observe();assert.deepEqual(report,{observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'malformed_rate_limits',planType:null,windows:[]});assert.equal(JSON.stringify(report).includes('PRIVATE'),false);
 }));
 
 test('M4 quota normalization uses limitId+duration identity across slot reorder; duplicate/missing identity is explicit',()=>{
-  const account={account:{planType:'PRO',email:'secret@example'}};
-  const left=normalizeQuota(account,{rateLimits:{limitId:'codex',primary:{windowDurationMins:300,usedPercent:1},secondary:{windowDurationMins:10080,usedPercent:2}}});
-  const right=normalizeQuota(account,{rateLimits:{limitId:'codex',secondary:{windowDurationMins:300,usedPercent:1},primary:{windowDurationMins:10080,usedPercent:2}}});
+  const left=normalizeQuota({rateLimits:{limitId:'codex',primary:{windowDurationMins:300,usedPercent:1},secondary:{windowDurationMins:10080,usedPercent:2}}});
+  const right=normalizeQuota({rateLimits:{limitId:'codex',secondary:{windowDurationMins:300,usedPercent:1},primary:{windowDurationMins:10080,usedPercent:2}}});
   assert.deepEqual(left.windows.map(x=>`${x.limitId}:${x.durationMinutes}`),right.windows.map(x=>`${x.limitId}:${x.durationMinutes}`));assert.notDeepEqual(left.windows.map(x=>x.slot),right.windows.map(x=>x.slot));
-  assert.equal(normalizeQuota(account,{rateLimits:{limitId:'codex',primary:{windowDurationMins:300,usedPercent:1},secondary:{windowDurationMins:300,usedPercent:2}}}).status,'ambiguous');
-  assert.equal(normalizeQuota(account,{rateLimits:{primary:{windowDurationMins:300,usedPercent:1}}}).status,'unavailable');
+  assert.equal(normalizeQuota({rateLimits:{limitId:'codex',primary:{windowDurationMins:300,usedPercent:1},secondary:{windowDurationMins:300,usedPercent:2}}}).status,'ambiguous');
+  assert.equal(normalizeQuota({rateLimits:{primary:{windowDurationMins:300,usedPercent:1}}}).status,'unavailable');
 });
 
 async function serverFixture(callback){const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m4-server-'));const database=openServerDatabase(path.join(root,'db.sqlite'));let now=NOW;try{const service=new MeterService(database,{adminPassword:'long enough test password',clock:()=>now,quotaStaleMs:60_000});
   const add=(id)=>{database.prepare('INSERT INTO devices(id,name,credential_hash,created_at,updated_at) VALUES(?,?,?,?,?)').run(id,id,'hash',new Date(now).toISOString(),new Date(now).toISOString());return database.prepare('SELECT * FROM devices WHERE id=?').get(id);};await callback({database,service,a:add('reporter'),b:add('other'),advance(ms){now+=ms;}});
   }finally{database.close();await rm(root,{recursive:true,force:true});}}
 function sync(quotaReport){return{agentVersion:'2.0',codexVersion:null,events:[],health:{status:'healthy'},...(quotaReport?{quotaReport}:{})};}
-function available(percent=10){return{observedAt:new Date(NOW).toISOString(),status:'available',planType:'pro',windows:[{limitId:'codex',durationMinutes:300,usedPercent:percent,resetsAt:'2026-08-30T13:00:00.000Z',slot:'primary'}]};}
+function available(percent=10,at=NOW){return{observedAt:new Date(at).toISOString(),status:'available',planType:'pro',windows:[{limitId:'codex',durationMinutes:300,usedPercent:percent,resetsAt:'2026-08-30T13:00:00.000Z',slot:'primary'}]};}
 
 test('M4 server rejects non-reporter quota, atomically replaces reporter current, persists snapshots, and marks stale',()=>serverFixture(async({database,service,a,b,advance})=>{
   service.updateSettings({quotaReporterDeviceId:a.id});assert.throws(()=>service.sync(b,sync(available())),error=>error instanceof ServiceError&&error.status===403);assert.equal(database.prepare('SELECT count(*) n FROM quota_current').get().n,0);
   service.sync(a,sync(available(10)));assert.equal(service.quotaCurrent().status,'available');assert.equal(service.quotaCurrent().windows[0].usedPercent,10);
-  service.sync(a,sync(available(20)));assert.equal(service.quotaCurrent().windows[0].usedPercent,20);assert.equal(database.prepare('SELECT count(*) n FROM quota_current').get().n,1);assert.equal(database.prepare('SELECT count(*) n FROM quota_snapshots').get().n,2);
-  advance(60_001);assert.equal(service.quotaCurrent().status,'stale');assert.equal(service.quotaCurrent().sourceStatus,'available');
+  service.sync(a,sync(available(20,NOW+1)));assert.equal(service.quotaCurrent().windows[0].usedPercent,20);assert.equal(database.prepare('SELECT count(*) n FROM quota_current').get().n,1);assert.equal(database.prepare('SELECT count(*) n FROM quota_snapshots').get().n,2);
+  advance(60_002);assert.equal(service.quotaCurrent().status,'stale');assert.equal(service.quotaCurrent().sourceStatus,'available');
   service.updateSettings({quotaReporterDeviceId:b.id});assert.equal(service.quotaCurrent().status,'unavailable');
 }));
 
@@ -59,7 +58,7 @@ test('M4 current quota is exposed through the authenticated versioned API',async
   const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m4-http-'));const database=openServerDatabase(path.join(root,'db.sqlite'));const server=createV2Server({database,adminPassword:'long enough test password',clock:()=>NOW});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const base=`http://127.0.0.1:${server.address().port}`;
   try{const login=await fetch(`${base}/api/v1/auth/login`,{method:'POST',headers:{origin:base,'content-type':'application/json'},body:JSON.stringify({password:'long enough test password'})});const cookie=login.headers.get('set-cookie').split(';')[0];
-    const response=await fetch(`${base}/api/v1/quota/current`,{headers:{origin:base,cookie}});assert.equal(response.status,200);assert.deepEqual(await response.json(),{observedAt:null,status:'unavailable',reporterDeviceId:null,planType:null,windows:[]});
+    const response=await fetch(`${base}/api/v1/quota/current`,{headers:{origin:base,cookie}});assert.equal(response.status,200);assert.deepEqual(await response.json(),{observedAt:null,status:'unavailable',reporterState:'no_reporter',reporterDeviceId:null,errorKind:null,planType:null,windows:[]});
   }finally{await new Promise(resolve=>server.close(resolve));database.close();await rm(root,{recursive:true,force:true});}
 });
 
