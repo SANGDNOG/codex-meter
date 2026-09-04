@@ -7,3 +7,7 @@ Prompts, messages, responses, source code, tool arguments, tool outputs, cwd, pa
 Never upload rollout JSONL or `auth.json` in bug reports, chat, CI artifacts, backups, or support requests. Share sanitized health/status output only after checking it contains no local path or credential.
 
 Existing files are baselined at installation. Recognized inherited histories are skipped. If inherited history in a new file cannot be separated safely, Codex Meter baselines the ambiguous file. This can undercount safely; it intentionally avoids privacy-heavy global lineage reconstruction and double counting.
+
+Collection is explicit opt-in per Device and Account Profile. Codex Meter does not discover, inspect, watch, baseline, modify, or report arbitrary Codex homes or launchers found on the computer. An unregistered environment remains outside Meter even when another environment on the same Device is tracked.
+
+For the Device's current Codex login, first binding starts at the current rollout EOF and does not modify existing Codex configuration, authentication, or session files. For a separate login, Meter creates only its own isolated home and launcher. Stopping tracking never deletes either kind of local environment.

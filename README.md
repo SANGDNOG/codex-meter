@@ -24,11 +24,23 @@ curl -fsS http://127.0.0.1:3000/api/v1/agent/releases/manifest.json
 
 The Compose example sets `CODEX_METER_RELEASE_DIR=/releases` and mounts host `./releases` at `/releases:ro`; Dashboard one-line installers depend on those release assets. The complete first-release tagging, asset download, checksum, and endpoint-verification procedure is in [V2 Server deployment](docs/v2-deployment.md).
 
-Put an HTTPS reverse proxy in front of the loopback-bound port. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and list the proxy's exact backend source IP in `CODEX_METER_TRUSTED_PROXIES` (Docker bridge/NAT deployments may not appear as loopback). Plaintext enrollment and Agent sync are rejected with HTTP 426. The single service stores its WAL-mode SQLite database at `/data/meter.db`; back up that file using a SQLite-safe backup or a stopped-container copy. Open the Dashboard, create Groups, choose **Add Device**, and run the displayed one-line installer. Released Agents for Linux x64, Windows x64, and macOS arm64 are self-contained and require no global Node.js or npm on monitored computers.
+Put an HTTPS reverse proxy in front of the loopback-bound port. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and list the proxy's exact backend source IP in `CODEX_METER_TRUSTED_PROXIES` (Docker bridge/NAT deployments may not appear as loopback). Plaintext enrollment and Agent sync are rejected with HTTP 426. The single service stores its WAL-mode SQLite database at `/data/meter.db`; back up that file using a SQLite-safe backup or a stopped-container copy.
+
+### Add a Device
+
+1. Choose **Add Device** in the Dashboard.
+2. Select the Account Profile to track and whether it uses the Device's current Codex login or a separate login.
+3. Run the displayed Linux, macOS, or Windows install command.
+4. If the Device shows **Login required**, run the exact login command shown there.
+
+No Account UUID, local path, JSON edit, or manual service restart is required. Released Agents are self-contained and require no global Node.js or npm on monitored computers.
+
+Codex Meter tracks only Codex environments explicitly added to a Device. Other launchers, accounts, and `CODEX_HOME` directories on the same computer remain untouched and are not reported to the Server.
 
 ### V2 semantics and caveats
 
 - Account quota reporting is **read-only, optional, and may be stale or unavailable**. It is never estimated from token counts.
+- Estimated quota contribution allocates provider-reported usage in proportion to locally tracked tokens. It is explicitly an estimate, not provider-attributed usage.
 - Group percentage is the **share of locally measured token usage**, not exact OpenAI quota attribution or billing.
 - Never upload Codex rollout JSONL or `auth.json`, including in support requests.
 - Recognized inherited fork/subagent/revert history is skipped. Ambiguous inherited files are baselined, so they **undercount safely** rather than risk double-counting.

@@ -14,6 +14,8 @@ const PLAN_TYPES = new Set(['free', 'plus', 'pro', 'team', 'business', 'enterpri
 const BINDING_MODES = new Set(['default','isolated','legacy']);
 const CONFIG_STATUSES = new Set(['unknown','applying','healthy','apply_failed','migration_attention_required']);
 const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped']);
+const REPORTING_PROFILE_STATES = new Set(['tracking','quota_available','quota_unavailable']);
+const SAFE_LOGICAL_LAUNCHER = /^cx[1-9][0-9]{0,2}$/;
 
 export class ServiceError extends Error {
   constructor(status, code, message = code) { super(message); this.status = status; this.code = code; }
@@ -100,7 +102,7 @@ function parseConfigurationState(value) {
   if(value.status==='healthy'&&value.appliedRevision!==value.desiredRevision)fail(400,'invalid_configuration_state');
   if(value.status==='apply_failed'&&(!errorKind||value.appliedRevision===value.desiredRevision))fail(400,'invalid_configuration_state');
   if(!Array.isArray(value.profiles)||value.profiles.length>64)fail(400,'invalid_configuration_state');
-  const profiles=value.profiles.map((profile)=>{exact(profile,['bindingId','accountId','mode','state'],['launcher']);if(!['default','isolated','preserve'].includes(profile.mode)||!PROFILE_STATES.has(profile.state))fail(400,'invalid_configuration_state');return{bindingId:id(profile.bindingId,'bindingId'),accountId:id(profile.accountId,'accountId'),mode:profile.mode,state:profile.state,launcher:profile.launcher===undefined?null:metadata(profile.launcher,'launcher')};});
+  const profiles=value.profiles.map((profile)=>{exact(profile,['bindingId','accountId','mode','state'],['launcher']);if(!['default','isolated','preserve'].includes(profile.mode)||!PROFILE_STATES.has(profile.state))fail(400,'invalid_configuration_state');const launcher=profile.launcher===undefined?null:metadata(profile.launcher,'launcher');if((launcher!==null&&!SAFE_LOGICAL_LAUNCHER.test(launcher))||(profile.mode==='default'&&launcher!==null))fail(400,'invalid_configuration_state');return{bindingId:id(profile.bindingId,'bindingId'),accountId:id(profile.accountId,'accountId'),mode:profile.mode,state:profile.state,launcher};});
   if(new Set(profiles.map((profile)=>profile.bindingId)).size!==profiles.length)fail(400,'invalid_configuration_state');
   return{desiredRevision:value.desiredRevision,appliedRevision:value.appliedRevision,status:value.status,errorKind,profiles};
 }
@@ -159,9 +161,12 @@ function membershipAt(database, deviceId, occurredAt) {
     ORDER BY valid_from DESC LIMIT 1`).get(deviceId, occurredAt, occurredAt)?.group_id ?? null;
 }
 function bindingAt(database, deviceId, accountId, occurredAt) {
-  return database.prepare(`SELECT b.id FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id
-    WHERE b.device_id=? AND b.account_id=? AND (b.mode='legacy' OR b.created_at<=?) AND (b.disabled_at IS NULL OR b.disabled_at>?)
-      AND (a.archived_at IS NULL OR a.archived_at>?) ORDER BY b.created_at DESC LIMIT 1`).get(deviceId,accountId,occurredAt,occurredAt,occurredAt);
+  return database.prepare(`SELECT b.id FROM device_account_bindings b
+    JOIN device_account_binding_periods p ON p.binding_id=b.id JOIN accounts a ON a.id=b.account_id
+    WHERE b.device_id=? AND b.account_id=?
+      AND (p.legacy_history=1 OR p.valid_from<=?)
+      AND (p.valid_until IS NULL OR p.valid_until>?)
+      AND (a.archived_at IS NULL OR a.archived_at>?) ORDER BY p.valid_from DESC LIMIT 1`).get(deviceId,accountId,occurredAt,occurredAt,occurredAt);
 }
 function closeOpenMembership(database, deviceId, at) {
   const open = database.prepare('SELECT id, valid_from FROM device_group_memberships WHERE device_id=? AND valid_until IS NULL').get(deviceId);
@@ -226,7 +231,7 @@ export class MeterService {
   listAccounts(rangeValue = 'all') {
     return this.database.prepare('SELECT * FROM accounts ORDER BY name,id').all().map((row) => {
       const devices=this.database.prepare('SELECT COUNT(*) count FROM device_account_bindings WHERE account_id=? AND disabled_at IS NULL').get(row.id).count;
-      return {...accountWire(row),devices,measured:this.usage(rangeValue,{accountId:row.id}).measured,quota:this.accountQuota(row.id)};
+      return {...accountWire(row),devices,measured:this.usage(rangeValue,{accountId:row.id}).measured,quota:this.accountQuota(row.id),trackingCoverage:this.trackingCoverage(row.id)};
     });
   }
   accountDetail(accountId, rangeValue = 'all') {
@@ -234,16 +239,16 @@ export class MeterService {
     const row = this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);
     if (!row) fail(404, 'account_not_found');
     const devices = this.database.prepare(`SELECT b.*,d.name device_name FROM device_account_bindings b
-      JOIN devices d ON d.id=b.device_id WHERE b.account_id=? ORDER BY d.name,d.id`).all(accountId).map((binding) => ({
-      ...bindingWire(binding), name: binding.device_name,
-      measured: this.usage(rangeValue, { accountId, deviceId: binding.device_id }).measured
-    }));
+      JOIN devices d ON d.id=b.device_id WHERE b.account_id=? ORDER BY d.name,d.id`).all(accountId).map((binding) => {
+      const device=this.database.prepare('SELECT d.*,g.name group_name FROM devices d LEFT JOIN groups g ON g.id=d.current_group_id WHERE d.id=?').get(binding.device_id);
+      return {...bindingWire(binding),name:binding.device_name,measured:this.usage(rangeValue,{accountId,deviceId:binding.device_id}).measured,...this.profilePresentation(device,binding)};
+    });
     const groups = this.database.prepare(`SELECT DISTINCT g.id,g.name FROM usage_events u JOIN groups g ON g.id=u.resolved_group_id
       WHERE u.account_id=? ORDER BY g.name,g.id`).all(accountId).map((group) => ({
       id: group.id, name: group.name, measured: this.usage(rangeValue, { accountId, groupId: group.id }).measured
     }));
     const unassigned = this.usage(rangeValue, { accountId, unassigned: true }).measured;
-    return { ...accountWire(row), measured: this.usage(rangeValue, { accountId }).measured, devices, groups, unassigned, quota: this.accountQuota(accountId) };
+    return { ...accountWire(row), measured: this.usage(rangeValue, { accountId }).measured, devices, groups, unassigned, quota: this.accountQuota(accountId), trackingCoverage:this.trackingCoverage(accountId) };
   }
   createAccount(body) {
     exact(body,['name'],['reference']); if('reference'in body&&typeof body.reference!=='boolean')fail(400,'invalid_field');
@@ -284,10 +289,20 @@ export class MeterService {
   }
   bindAccount(deviceId,body){
     id(deviceId,'deviceId');this.deviceDetail(deviceId);exact(body,['accountId'],['mode','codexHomeKey']);const accountId=id(body.accountId,'accountId');
-    const mode=body.mode===undefined?'legacy':body.mode;if(!BINDING_MODES.has(mode)||mode==='legacy'&&body.codexHomeKey===undefined&&body.mode!==undefined)fail(400,'invalid_mode');
+    const existing=this.database.prepare('SELECT * FROM device_account_bindings WHERE device_id=? AND account_id=?').get(deviceId,accountId);
+    const mode=body.mode===undefined?(existing?.mode??'legacy'):body.mode;if(!BINDING_MODES.has(mode)||mode==='legacy'&&body.codexHomeKey===undefined&&body.mode!==undefined)fail(400,'invalid_mode');
     if(body.codexHomeKey!==undefined&&!metadata(body.codexHomeKey,'codexHomeKey'))fail(400,'invalid_field');
-    if(!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');const now=nowIso(this.clock),binding={id:randomUUID(),deviceId,accountId,mode:mode==='legacy'?'preserve':mode,createdAt:now,disabledAt:null};
-    try{tx(this.database,()=>{this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(binding.id,deviceId,accountId,body.codexHomeKey??randomUUID(),mode,now);this.publishDeviceConfiguration(deviceId);});}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_mode_conflict');throw error;}return binding;
+    if(!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');
+    if(existing&&!existing.disabled_at)fail(409,'binding_exists_or_mode_conflict');
+    if(existing&&body.codexHomeKey!==undefined&&body.codexHomeKey!==existing.codex_home_key)fail(409,'binding_identity_conflict');
+    const now=nowIso(this.clock),binding={id:existing?.id??randomUUID(),deviceId,accountId,mode:mode==='legacy'?'preserve':mode,createdAt:existing?.created_at??now,disabledAt:null};
+    try{tx(this.database,()=>{
+      if(existing){
+        this.database.prepare('UPDATE device_account_bindings SET mode=?,disabled_at=NULL WHERE id=?').run(mode,existing.id);
+        this.database.prepare('INSERT INTO device_account_binding_periods(binding_id,valid_from) VALUES(?,?)').run(existing.id,now);
+      }else this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(binding.id,deviceId,accountId,body.codexHomeKey??randomUUID(),mode,now);
+      this.publishDeviceConfiguration(deviceId);
+    });}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_mode_conflict');throw error;}return binding;
   }
   disableBinding(deviceId,bindingId){
     id(deviceId,'deviceId');id(bindingId,'bindingId');const row=this.database.prepare('SELECT * FROM device_account_bindings WHERE id=? AND device_id=?').get(bindingId,deviceId);if(!row)fail(404,'binding_not_found');
@@ -376,6 +391,31 @@ export class MeterService {
     return age<onlineSeconds?'online':age<=staleSeconds?'stale':'offline';
   }
   deviceWire(row) { const desired=row.desired_config_revision??0,applied=row.applied_config_revision??0,reported=row.configuration_status??'unknown';return { id: row.id, name: row.name, currentGroupId: row.current_group_id, currentGroupName: row.group_name ?? null, disabledAt: row.disabled_at, removedAt: row.removed_at, lastSeenAt: row.last_seen_at, state:this.deviceState(row), agentVersion: row.agent_version, codexVersion: row.codex_version, health: row.health_status ?? 'unknown', desiredRevision:desired, appliedRevision:applied, configurationStatus:row.declarative_profiles_supported?(applied<desired&&reported==='healthy'?'applying':reported):'unsupported', configurationErrorKind:row.configuration_error_kind??null, configurationReportedAt:row.configuration_reported_at??null, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  profilePresentation(device,binding){
+    const actual=this.database.prepare('SELECT state,launcher_name launcher,reported_at reportedAt FROM device_profile_status WHERE device_id=? AND binding_id=?').get(device.id,binding.id)??null;
+    const deviceView=this.deviceWire(device),lastActivityAt=this.database.prepare('SELECT MAX(occurred_at) value FROM usage_events WHERE device_id=? AND account_id=?').get(device.id,binding.account_id).value??null;
+    let trackingState;
+    if(binding.disabled_at)trackingState=actual&&deviceView.appliedRevision<deviceView.desiredRevision?'stop_tracking_pending':'stopped';
+    else if(!device.last_seen_at)trackingState='waiting_for_agent';
+    else if(!actual&&deviceView.configurationStatus==='apply_failed')trackingState='apply_failed';
+    else if(!actual)trackingState='applying';
+    else if(deviceView.state!=='online')trackingState='agent_offline';
+    else if(actual.state==='login_required')trackingState='login_required';
+    else if(actual.state==='quota_unavailable')trackingState='quota_unavailable';
+    else if(actual.state==='apply_failed'||actual.state==='migration_attention_required')trackingState='apply_failed';
+    else trackingState='tracking';
+    return{actual,trackingState,lastActivityAt,deviceState:deviceView.state,configurationStatus:deviceView.configurationStatus};
+  }
+  trackingCoverage(accountId){
+    const bindings=this.database.prepare(`SELECT b.id binding_id,b.device_id,b.account_id,d.* FROM device_account_bindings b JOIN devices d ON d.id=b.device_id
+      WHERE b.account_id=? AND b.disabled_at IS NULL AND d.removed_at IS NULL ORDER BY d.id`).all(accountId);
+    let reporting=0;
+    for(const binding of bindings){
+      const actual=this.database.prepare('SELECT state FROM device_profile_status WHERE device_id=? AND binding_id=?').get(binding.device_id,binding.binding_id);
+      if(this.deviceState(binding)==='online'&&actual&&REPORTING_PROFILE_STATES.has(actual.state))reporting+=1;
+    }
+    return{registeredDevices:bindings.length,reportingDevices:reporting,status:bindings.length===0?'unknown':reporting===bindings.length?'full':reporting===0?'none':'partial'};
+  }
   enrollmentStatus(enrollmentId) {
     id(enrollmentId,'enrollmentId'); const row=this.database.prepare('SELECT id,expires_at,device_id FROM device_enrollments WHERE id=?').get(enrollmentId);
     if(!row)fail(404,'enrollment_not_found');
@@ -387,8 +427,7 @@ export class MeterService {
     const memberships = this.database.prepare(`SELECT m.group_id groupId,g.name groupName,m.valid_from validFrom,m.valid_until validUntil
       FROM device_group_memberships m JOIN groups g ON g.id=m.group_id WHERE m.device_id=? ORDER BY m.valid_from`).all(deviceId).map((r)=>({...r}));
     const profiles=this.database.prepare(`SELECT b.*,a.name,a.reference,a.archived_at account_archived_at FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id WHERE b.device_id=? ORDER BY a.name`).all(deviceId).map((binding)=>({
-      ...bindingWire(binding),name:binding.name,reference:Boolean(binding.reference),accountArchivedAt:binding.account_archived_at,measured:this.usage('all',{deviceId,accountId:binding.account_id}).measured,
-      actual:this.database.prepare('SELECT state,launcher_name launcher,reported_at reportedAt FROM device_profile_status WHERE device_id=? AND binding_id=?').get(deviceId,binding.id)??null
+      ...bindingWire(binding),name:binding.name,reference:Boolean(binding.reference),accountArchivedAt:binding.account_archived_at,measured:this.usage('all',{deviceId,accountId:binding.account_id}).measured,...this.profilePresentation(row,binding)
     }));
     return { ...this.deviceWire(row), memberships, profiles };
   }

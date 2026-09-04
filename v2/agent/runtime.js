@@ -1,10 +1,13 @@
 import { watch } from 'node:fs';
-import { lstat, mkdir, readlink, realpath } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { AgentCollector } from './collector.js';
 import { AgentSyncClient } from './sync.js';
 import { AGENT_VERSION } from './config.js';
 import { applyDesiredConfiguration, assignmentRows, importLegacyProfiles } from './assignments.js';
+import { canonicalHome, homesOverlap } from './paths.js';
+
+export { canonicalHome } from './paths.js';
 
 function delay(ms) { return new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); }); }
 function setState(database, key, value) {
@@ -12,36 +15,13 @@ function setState(database, key, value) {
   database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(key, value, at);
 }
-export async function canonicalHome(value, seen=new Set()) {
-  const resolved=path.resolve(value),parsed=path.parse(resolved);
-  const segments=resolved.slice(parsed.root.length).split(path.sep).filter(Boolean);
-  let current=parsed.root;
-  for(let index=0;index<segments.length;index++){
-    const candidate=path.join(current,segments[index]);
-    try{
-      const stat=await lstat(candidate);
-      if(stat.isSymbolicLink()){
-        const target=await readlink(candidate);
-        const targetPath=path.resolve(path.dirname(candidate),target);
-        if(seen.has(targetPath))throw new Error('CODEX_HOME contains a symbolic-link cycle');
-        current=await canonicalHome(targetPath,new Set([...seen,targetPath]));
-      }else current=candidate;
-    }catch(error){
-      if(error?.code!=='ENOENT')throw error;
-      current=path.join(current,...segments.slice(index));
-      break;
-    }
-  }
-  try{current=await realpath(current);}catch(error){if(error?.code!=='ENOENT')throw error;}
-  return process.platform==='win32'?current.toLowerCase():current;
-}
 export async function assertProfilesCanonicalDisjoint(profiles) {
   const roots=[];
   const comparable=(value)=>process.platform==='win32'?value.toLowerCase():value;
   for(const profile of profiles)roots.push({accountId:profile.accountId,root:comparable(await canonicalHome(profile.codexHome))});
   for(let index=0;index<roots.length;index++)for(let other=index+1;other<roots.length;other++){
     const left=roots[index],right=roots[other];
-    if(left.root===right.root||left.root.startsWith(`${right.root}${path.sep}`)||right.root.startsWith(`${left.root}${path.sep}`))
+    if(homesOverlap(left.root,right.root))
       throw new Error(`Profile CODEX_HOME roots must be dedicated and non-overlapping: ${left.accountId}, ${right.accountId}`);
   }
 }
@@ -112,7 +92,10 @@ export class AgentRuntime {
     if (this.running) return; this.running = true;
     const profiles = this.config.profiles ?? [];
     if (profiles.length) { await assertProfilesCanonicalDisjoint(profiles); for (const profile of profiles) await bindProfileHome(this.database, profile); }
-    else await mkdir(this.config.codexHome, { recursive: true });
+    else {
+      const appliedRevision=Number(this.database.prepare("SELECT value FROM agent_state WHERE key='applied_config_revision'").get()?.value??0);
+      if(!Number.isSafeInteger(appliedRevision)||appliedRevision===0)await mkdir(this.config.codexHome,{recursive:true});
+    }
     await importLegacyProfiles(this.database,this.config);this.installAssignments();await this.reconcile();this.refreshWatchers();
     this.loops = [this.loop(this.config.reconcileIntervalMs, () => this.reconcile()),
       this.loop(this.config.syncIntervalMs, () => this.sync()), this.loop(this.config.heartbeatIntervalMs, () => this.sync(true))];

@@ -14,9 +14,14 @@ The monitored machine needs Codex CLI and its own local Codex authentication, bu
 
 ## Install from the Dashboard
 
-In the Dashboard: create/select a Group, choose **Add Device**, name it, and copy the one-line command. Enrollment tokens are one-time and expire after about 15 minutes.
+1. Choose **Add Device** and enter the Device name.
+2. Select the Account Profile to track. Choose **Use this device's current Codex login** for the normal single-login setup, or **Add another Codex login** for a separate environment.
+3. Run the displayed Linux, macOS, or Windows command.
+4. If the Device page shows **Login required**, run the exact `codex login` or generated launcher command shown there.
 
-Linux/macOS use the displayed `curl ... install.sh` command; Windows uses the displayed PowerShell command. Each installer downloads `/api/v1/agent/releases/manifest.json`, selects Linux x64, macOS arm64, or Windows x64, downloads the referenced artifact from the same Server, verifies its SHA-256, enrolls without manually entering IDs, protects the credential file, and installs a per-user systemd service, LaunchAgent, or least-privilege scheduled task.
+Enrollment tokens are one-time, expire after about 15 minutes, and are exchanged for a Device credential during enrollment. The permanent credential is not included in the bootstrap URL or shown in the Dashboard.
+
+Linux/macOS use the displayed `curl ... install.sh` command; Windows uses the displayed PowerShell command. Each installer downloads `/api/v1/agent/releases/manifest.json`, selects Linux x64, macOS arm64, or Windows x64, downloads the referenced artifact from the same Server, verifies its SHA-256, enrolls without manually entering IDs, protects the credential file, and installs and starts a per-user systemd service, LaunchAgent, or least-privilege scheduled task.
 
 If installation fails while downloading the manifest or artifact, verify that all five files exist under the Server host's `./releases/`, that `sha256sum --check SHA256SUMS` succeeds there, and that the public release endpoint returns them. Do not bypass checksum validation or build platform binaries inside the Server image.
 
@@ -24,41 +29,20 @@ Check with `codex-meter-agent status`. Upgrade with `codex-meter-agent update`; 
 
 Never upload rollout JSONL or `auth.json` to install or debug Codex Meter.
 
-## V2.1 explicit local profiles
+## Account Profile environments
 
-An Account in Codex Meter is an administrator-created **local profile**, not a verified OpenAI account. Create the profile in **Accounts**, then bind it to each participating device through the account-binding API using a non-secret opaque `codexHomeKey`. The key is only a local binding label; never use a path, email address, credential, or provider identifier.
+An Account Profile is an administrator label, not a verified provider identity. The Server declares only the profile ID, label, and environment type. It never receives a local path, executable path, provider email, or credential.
 
-Configure each Agent with a dedicated home per profile:
+**Use this device's current Codex login** adopts the operating system's normal Codex home. The Agent sets the first-binding baseline at the current end of existing rollouts. It does not rewrite `config.toml`, inspect or change authentication files, create a managed marker, move sessions, or import old usage.
 
-```json
-{
-  "serverUrl": "https://meter.example.com",
-  "deviceId": "device-id",
-  "deviceSecret": "device-secret",
-  "profiles": [
-    { "accountId": "server-profile-id", "name": "Work", "codexHome": "/home/me/.codex-work" },
-    { "accountId": "another-profile-id", "name": "Personal", "codexHome": "/home/me/.codex-personal" }
-  ]
-}
-```
+**Add another Codex login** creates a private Meter-managed home and a safe logical launcher such as `cx2`. The Agent creates the credential-store setting and ownership marker only inside that new managed home. Use the exact launcher command shown on the Device page to sign in. Meter never performs sign-in itself.
 
-On startup, the Agent creates each managed home privately, records a local non-secret ownership marker (`.codex-meter-profile.json`) containing only the Codex Meter profile ID, and creates or validates `config.toml` with `cli_auth_credentials_store = "file"`. The ownership marker prevents a removed profile path from later being assigned to another profile; do not delete or edit it. A conflicting credential-store setting or ownership marker stops startup. The Agent does not inspect `auth.json` and never initiates login or logout. Authenticate manually in the selected home.
+Adding or stopping an Account Profile is applied by the next Agent sync without editing `agent.json` or restarting the service. Stopping tracking leaves the Codex login, sessions, launcher, local home, Meter history, cursor, outbox, and quota history intact.
 
-Add and initialize a profile locally after the administrator creates the server binding, then generate a short launcher:
-
-```sh
-codex-meter-agent profile-add --account server-profile-id --name Work --codex-home "$HOME/.codex-profiles/work"
-codex-meter-agent profile-launcher --account server-profile-id > codex-work
-chmod 700 codex-work
-./codex-work
-```
-
-On Windows, save the command output as a `.ps1` file and pass Codex arguments to that script. The launcher sets `CODEX_HOME` only for the spawned Codex CLI. Do not reuse a managed home for another profile; archive the old profile and create a new one instead.
-
-Existing V2.0.1 configurations with one `codexHome` continue to collect and sync legacy events with a NULL account attribution.
+Only environments explicitly selected in the Dashboard are eligible for collection. The Agent does not scan arbitrary launchers or Codex homes. Upgrade migration imports only profiles already present in Codex Meter's local configuration.
 
 ## Quota reporter command discovery
 
-The installers capture an absolute `codex` command path when one is safely discoverable and store it only in the local Agent configuration as `codexExecutable`. They do not broaden the service `PATH`, and this path is never included in Agent sync payloads. Enrollment also accepts `--codex-executable /absolute/path/to/codex`; Account Profiles may override it with the same option on `profile-add`.
+The installers capture an absolute `codex` command path when one is safely discoverable and store it only in the local Agent configuration as `codexExecutable`. They do not broaden the service `PATH`, and this path is never included in Agent sync payloads. Advanced command-line overrides remain available for troubleshooting, but are not part of normal onboarding.
 
 Reporter designation is learned from a heartbeat (60 seconds by default), then quota is sent on the next sync (15 seconds by default). The documented worst case is therefore **75 seconds**. The Agent uses the existing periodic cycles and does not busy-loop.

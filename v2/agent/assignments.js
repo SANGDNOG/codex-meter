@@ -4,6 +4,7 @@ import path from 'node:path';
 import { AgentCollector } from './collector.js';
 import { initializeManagedHome, profileLauncher } from './config.js';
 import { lifecyclePaths } from './lifecycle.js';
+import { canonicalHome, homesOverlap } from './paths.js';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MODES = new Set(['default','isolated','preserve']);
@@ -96,7 +97,7 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
   try{desired=validateDesiredConfiguration(raw);}
   catch(error){
     const candidate=raw&&typeof raw==='object'&&Number.isSafeInteger(raw.revision)&&raw.revision>=0?raw.revision:null;
-    if(candidate!==null&&candidate>=currentDesired){state(database,'desired_config_revision',candidate,clock);state(database,'configuration_status','apply_failed',clock);state(database,'configuration_error_kind',error.message.replace(/[^A-Za-z0-9_:-]+/g,'_').slice(0,100)||'apply_failed',clock);}
+    if(candidate!==null&&candidate>=currentDesired){state(database,'desired_config_revision',candidate,clock);state(database,'configuration_status','apply_failed',clock);state(database,'configuration_error_kind','invalid_desired_configuration',clock);}
     return{applied:false,error,...configurationState(database)};
   }
   if(desired.revision<currentDesired)return{ignored:true,reason:'older_revision',...configurationState(database)};
@@ -110,19 +111,24 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
       if(previous?.origin==='imported'&&(declaration.mode==='preserve'||declaration.mode==='isolated')){mode='preserve';origin='imported';localHome=previous.localHome;}
       else if(declaration.mode==='default'){localHome=config.codexHome;launcherName=null;}
       else if(declaration.mode==='preserve'&&previous){mode=previous.mode;origin=previous.origin;localHome=previous.localHome;}
+      else if(declaration.mode==='preserve'&&existing.length===0&&(config.profiles?.length??0)===0&&desired.profiles.length===1){mode='preserve';origin='imported';localHome=config.codexHome;launcherName=null;}
       else if(declaration.mode==='preserve')throw new Error('preserve profile has no local assignment');
       else{localHome=previous?.active&&previous.mode==='isolated'?previous.localHome:isolatedRoot(config,declaration.bindingId);initialize=true;}
       planned.push({...declaration,mode,origin,localHome,launcherName,initialize});
     }
-    const canonicalHomes=planned.map((entry)=>path.resolve(entry.localHome));
-    if(new Set(platform==='win32'?canonicalHomes.map((v)=>v.toLowerCase()):canonicalHomes).size!==canonicalHomes.length)throw new Error('profile homes overlap');
+    const canonicalHomes=[];
+    for(const entry of planned)canonicalHomes.push(await canonicalHome(entry.localHome,{platform}));
+    if(new Set(canonicalHomes).size!==canonicalHomes.length)throw new Error('profile homes overlap');
     for(let left=0;left<canonicalHomes.length;left++)for(let right=left+1;right<canonicalHomes.length;right++){
-      const a=canonicalHomes[left],b=canonicalHomes[right];if(a.startsWith(`${b}${path.sep}`)||b.startsWith(`${a}${path.sep}`))throw new Error('profile homes overlap');
+      if(homesOverlap(canonicalHomes[left],canonicalHomes[right]))throw new Error('profile homes overlap');
     }
+    const protectedDefault=await canonicalHome(config.codexHome,{platform});
+    for(let index=0;index<planned.length;index++)if(planned[index].initialize&&homesOverlap(canonicalHomes[index],protectedDefault))throw new Error('managed profile overlaps default home');
     for(const entry of planned)if(entry.initialize){await initializeManagedHome(entry.localHome,entry.accountId);if(!entry.launcherName){const created=await createLauncher({codexHome:entry.localHome,codexExecutable:config.codexExecutable},{directory:launcherDirectory,platform});entry.launcherName=created.name;}}
     for(const entry of planned){
-      const changed=!byAccount.has(entry.accountId)||byAccount.get(entry.accountId).bindingId!==entry.bindingId||byAccount.get(entry.accountId).localHome!==entry.localHome;
-      if(changed){const collector=new AgentCollector(database,{home:entry.localHome,accountId:entry.accountId});await (baseline?baseline(collector,entry):collector.reconcile());}
+      const prior=byAccount.get(entry.accountId),reactivated=prior&&!prior.active,homeChanged=prior&&prior.localHome!==entry.localHome;
+      const changed=!prior||reactivated||prior.bindingId!==entry.bindingId||homeChanged;
+      if(changed){const collector=new AgentCollector(database,{home:entry.localHome,accountId:entry.accountId,clock});await (baseline?baseline(collector,entry):reactivated||homeChanged?collector.baselineCurrent():collector.reconcile());}
     }
     const now=new Date(clock()).toISOString();database.exec('BEGIN IMMEDIATE');
     try{
@@ -132,7 +138,7 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
       state(database,'applied_config_revision',desired.revision,clock);state(database,'configuration_status','healthy',clock);state(database,'configuration_error_kind','',clock);database.exec('COMMIT');
     }catch(error){database.exec('ROLLBACK');throw error;}
     return{applied:true,...configurationState(database)};
-  }catch(error){state(database,'configuration_status','apply_failed',clock);state(database,'configuration_error_kind',error.message.replace(/[^A-Za-z0-9_:-]+/g,'_').slice(0,100)||'apply_failed',clock);return{applied:false,error,...configurationState(database)};}
+  }catch(error){state(database,'configuration_status','apply_failed',clock);state(database,'configuration_error_kind','profile_apply_failed',clock);return{applied:false,error,...configurationState(database)};}
 }
 
 export async function inspectLauncher(filename){return readFile(filename,'utf8');}

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { openAgentDatabase } from '../v2/agent/database.js';
@@ -67,6 +67,19 @@ test('Core default home adoption baselines without modifying the external home o
   assert.deepEqual(after.map(x=>[x.name,x.size,x.mtimeMs]),before.map(x=>[x.name,x.size,x.mtimeMs]));
   const rejected=await applyDesiredConfiguration(database,config,desired(2,[{bindingId:'b1',accountId:'a1',name:'Personal',mode:'default'},{bindingId:'b2',accountId:'a2',name:'Research',mode:'default'}]),{clock:()=>NOW,baseline:async()=>{}});
   assert.equal(rejected.applied,false);assert.equal(configurationState(database).appliedRevision,1);assert.deepEqual(assignmentRows(database).map(row=>row.accountId),['a1']);
+}));
+
+test('Core single legacy preserve declaration adopts only the configured Meter home',()=>tempDatabase(async({root,database})=>{
+  const home=path.join(root,'.codex'),config={codexHome:home,databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex')};let baselines=0;
+  const result=await applyDesiredConfiguration(database,config,desired(1,[{bindingId:'legacy-binding',accountId:'legacy-account',name:'Legacy',mode:'preserve'}]),{clock:()=>NOW,baseline:async()=>{baselines+=1;}});
+  assert.equal(result.applied,true);assert.equal(baselines,1);assert.deepEqual(assignmentRows(database).map(row=>[row.accountId,row.mode,row.origin,row.localHome]),[['legacy-account','preserve','imported',home]]);
+}));
+
+test('Core managed isolated homes cannot enter the default home through a symlink',()=>tempDatabase(async({root,database})=>{
+  const physicalDefault=path.join(root,'default-home'),linkedDefault=path.join(root,'linked-default');await mkdir(physicalDefault);await symlink(physicalDefault,linkedDefault);
+  const config={codexHome:linkedDefault,databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex')},candidate=desired(1,[{bindingId:'isolated-binding',accountId:'isolated-account',name:'Research',mode:'isolated'}]);
+  const result=await applyDesiredConfiguration(database,config,candidate,{clock:()=>NOW,isolatedRoot:()=>path.join(physicalDefault,'managed'),launcherDirectory:path.join(root,'bin'),platform:'linux'});
+  assert.equal(result.applied,false);assert.equal(configurationState(database).appliedRevision,0);assert.equal(configurationState(database).errorKind,'profile_apply_failed');assert.equal(configurationState(database).errorKind.includes(root),false);await assert.rejects(stat(path.join(physicalDefault,'managed')));
 }));
 
 test('Core cx1/cx2 import is zero-touch for homes, launchers, cursors, outbox, history, and authentication environment',()=>tempDatabase(async({root,database})=>{
@@ -153,6 +166,12 @@ test('Core an applied empty declarative revision never falls back to an unrelate
   await runtime.applyConfiguration(desired(2,[]));assert.equal(configurationState(database).appliedRevision,2);assert.deepEqual(assignmentRows(database),[]);assert.deepEqual(runtime.collectors,[]);assert.deepEqual(configured.at(-1),[]);assert.equal(watched.size,0);assert.equal([...watched.keys()].some(value=>value.startsWith(defaultHome)),false);assert.deepEqual(await runtime.reconcile(),[]);runtime.running=false;
 }));
 
+test('Core runtime start leaves an absent default home untouched after declarative opt-in',()=>tempDatabase(async({root,database})=>{
+  const defaultHome=path.join(root,'untracked-default'),config={codexHome:defaultHome,databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex'),profiles:[],reconcileIntervalMs:999999,syncIntervalMs:999999,heartbeatIntervalMs:999999};
+  await applyDesiredConfiguration(database,config,desired(1,[]),{clock:()=>NOW});const configured=[];const runtime=new AgentRuntime(database,config,{syncClient:{configureProfiles(rows){configured.push(rows);},async sync(){return{configuration:null};}},watchImpl:()=>{throw new Error('untracked home must not be watched');}});
+  await runtime.start();assert.deepEqual(runtime.collectors,[]);assert.deepEqual(configured.at(-1),[]);await assert.rejects(stat(defaultHome));await runtime.stop();
+}));
+
 test('Core default-home real rollout baselines old usage, uploads only new usage, and rebinds without reassignment',()=>tempDatabase(async({root,database})=>{
   const home=path.join(root,'.codex'),rollout=path.join(home,'sessions','2026','09','01','rollout-cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl');await mkdir(path.dirname(rollout),{recursive:true});await writeFile(rollout,META('cccccccc-cccc-4ccc-8ccc-cccccccccccc')+USAGE(100,0));await writeFile(path.join(home,'config.toml'),'theme = "safe"\n');await writeFile(path.join(home,'auth.json'),'opaque');
   const protectedBefore=await Promise.all(['config.toml','auth.json'].map(async name=>[name,await readFile(path.join(home,name),'utf8'),(await stat(path.join(home,name))).mtimeMs]));
@@ -205,7 +224,7 @@ test('Core captured watcher callbacks never reactivate obsolete collectors acros
 test('Core partial isolated-home failure keeps revision N active and retries idempotently',()=>tempDatabase(async({root,database})=>{
   const config={codexHome:path.join(root,'.codex'),databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex')};const options={clock:()=>NOW,isolatedRoot:(_config,binding)=>binding==='a'?path.join(root,'Home A'):path.join(root,'blocked','Home B'),launcherDirectory:path.join(root,'bin'),platform:'linux',baseline:async()=>{}};
   await applyDesiredConfiguration(database,config,desired(1,[{bindingId:'stable',accountId:'stable',name:'Stable',mode:'default'}]),options);await writeFile(path.join(root,'blocked'),'not a directory');
-  const candidate=desired(2,[{bindingId:'a',accountId:'a',name:'A',mode:'isolated'},{bindingId:'b',accountId:'b',name:'B',mode:'isolated'}]);const failed=await applyDesiredConfiguration(database,config,candidate,options);assert.equal(failed.applied,false);assert.equal(configurationState(database).appliedRevision,1);assert.deepEqual(assignmentRows(database).map(row=>row.accountId),['stable']);assert.equal(JSON.parse(await readFile(path.join(root,'Home A','.codex-meter-profile.json'),'utf8')).accountId,'a');assert.equal(database.prepare("SELECT COUNT(*) count FROM profile_assignments WHERE account_id IN ('a','b') AND active=1").get().count,0);assert.deepEqual(await readdir(path.join(root,'bin')),['cx1']);
+  const candidate=desired(2,[{bindingId:'a',accountId:'a',name:'A',mode:'isolated'},{bindingId:'b',accountId:'b',name:'B',mode:'isolated'}]);const failed=await applyDesiredConfiguration(database,config,candidate,options);assert.equal(failed.applied,false);assert.equal(configurationState(database).appliedRevision,1);assert.equal(configurationState(database).errorKind,'profile_apply_failed');assert.equal(configurationState(database).errorKind.includes(root),false);assert.deepEqual(assignmentRows(database).map(row=>row.accountId),['stable']);assert.equal(JSON.parse(await readFile(path.join(root,'Home A','.codex-meter-profile.json'),'utf8')).accountId,'a');assert.equal(database.prepare("SELECT COUNT(*) count FROM profile_assignments WHERE account_id IN ('a','b') AND active=1").get().count,0);assert.deepEqual(await readdir(path.join(root,'bin')),['cx1']);
   await rm(path.join(root,'blocked'));const retried=await applyDesiredConfiguration(database,config,candidate,options);assert.equal(retried.applied,true);assert.equal(configurationState(database).appliedRevision,2);assert.deepEqual(assignmentRows(database).map(row=>row.accountId).sort(),['a','b']);assert.deepEqual((await readdir(path.join(root,'bin'))).sort(),['cx1','cx2']);assert.deepEqual(assignmentRows(database).map(row=>row.launcherName).sort(),['cx1','cx2']);
 }));
 
@@ -223,6 +242,7 @@ test('Core actual-state validation is enforced over HTTP without corrupting last
       [{...valid,profiles:[...valid.profiles,profile('extra',account.id)]},'extra_configuration_profile'],
       [{...valid,profiles:[profile(binding.id,'wrong-account')]},'wrong_configuration_account'],
       [{...valid,profiles:[profile(binding.id,account.id,'isolated')]},'wrong_configuration_mode'],
+      [{...valid,profiles:[{...profile(binding.id,account.id),launcher:'sudo'}]},'invalid_configuration_state'],
       [{...valid,status:'apply_failed',errorKind:'failed'},'invalid_configuration_state']
     ];
     for(const [candidate,code] of cases){const response=await request(candidate);assert.equal(response.status,400,code);assert.equal(response.body.error,code);assert.deepEqual(snapshot(),before);}

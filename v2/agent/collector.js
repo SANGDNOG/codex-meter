@@ -60,6 +60,29 @@ export class AgentCollector {
 
   identity(value) { return this.bindingKey ? `${this.bindingKey}\0${value}` : value; }
   baselineKey() { return this.bindingKey ? `installation_baselined:${hash(this.bindingKey)}` : 'installation_baselined'; }
+  reactivationKey() { return `reactivation_baseline:${hash(this.bindingKey ?? '')}`; }
+
+  async baselineCurrent() {
+    const discovery=await this.discovery({home:this.home}),baselines=[];
+    for(const file of discovery.files){
+      try{baselines.push([file,await safeBaseline(file.path)]);}catch(error){if(error.code!=='ENOENT')throw error;}
+    }
+    transaction(this.database,()=>{
+      for(const [file,base] of baselines)putCursor(this.database,{...file,physicalIdentity:this.identity(file.physicalIdentity)},{...base,classification:'baseline'});
+      const timestamp=new Date(this.clock()).toISOString();
+      for(const file of discovery.compressedFiles??[]){
+        const identity=this.identity(file.physicalIdentity);
+        this.database.prepare('DELETE FROM rollout_cursors WHERE rollout_key=?').run(hash(identity));
+        this.database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(`compressed_baseline:${hash(identity)}`,'1',timestamp);
+      }
+      this.database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(this.baselineKey(),timestamp,timestamp);
+      this.database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(this.reactivationKey(),timestamp,timestamp);
+    });
+    return{baseline:baselines.length,events:0,files:discovery.files.length,compressedOnly:discovery.compressedOnly};
+  }
 
   async reconcile() {
     const discovery = await this.discovery({ home: this.home });
@@ -125,9 +148,12 @@ export class AgentCollector {
     if (parsed.disappeared) return 0;
     const parser = createTelemetryParser({ model: current.model, reasoningEffort: current.reasoning_effort });
     const additions = [];
+    const notBeforeRaw=this.database.prepare('SELECT value FROM agent_state WHERE key=?').get(this.reactivationKey())?.value;
+    const notBefore=notBeforeRaw==null?null:Date.parse(notBeforeRaw);
     for (const line of parsed.lines) {
       const event = parser.parse(line.record);
-      if (event) additions.push({ event, id: hash(`${scopedDescriptor.physicalIdentity}\0${line.start}\0${line.end}\0${JSON.stringify(event)}`) });
+      const occurredAt=event?Date.parse(event.occurredAt):NaN;
+      if (event && (notBefore===null||(Number.isFinite(notBefore)&&Number.isFinite(occurredAt)&&occurredAt>=notBefore))) additions.push({ event, id: hash(`${scopedDescriptor.physicalIdentity}\0${line.start}\0${line.end}\0${JSON.stringify(event)}`) });
     }
     const finalContext = parser.context();
     transaction(this.database, () => {
