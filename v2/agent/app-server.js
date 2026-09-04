@@ -89,6 +89,7 @@ export class ReadOnlyAppServerClient {
     try {
       this.child = this.spawn(this.command, ['app-server', '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false,
         env: this.codexHome ? { ...process.env, CODEX_HOME: this.codexHome } : process.env });
+      this.child.stdin?.on('error', (error) => this.#rejectAll(safeError(error, this.command)));
       this.child.stderr?.resume?.(); // Drain, but never retain or log diagnostics.
       this.child.stdout?.on('data', (chunk) => this.#consume(chunk));
       this.child.once('error', (error) => this.#rejectAll(safeError(error, this.command)));
@@ -103,8 +104,9 @@ export class ReadOnlyAppServerClient {
   }
   readRateLimits() { return this.#request('account/rateLimits/read', null); }
   #write(message) {
-    if (!this.child?.stdin?.writable) throw new SafeAppServerError('app_server_unavailable');
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    const input = this.child?.stdin;
+    if (!input?.writable || input.destroyed || input.writableEnded) throw new SafeAppServerError('app_server_unavailable');
+    input.write(`${JSON.stringify(message)}\n`, (error) => { if (error) this.#rejectAll(safeError(error, this.command)); });
   }
   #request(method, params) {
     const id = this.nextId++;

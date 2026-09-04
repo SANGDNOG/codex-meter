@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,6 +33,18 @@ test('M4 App Server performs bounded correlated handshake and only fixed read-on
 test('M4 App Server ignores malformed, oversized, notifications, wrong IDs and never leaks raw stderr/response',async()=>fakeAppServer(`const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);process.stderr.write('STDERR_PRIVATE');if(x.method==='initialized')return;if(x.method==='initialize')return process.stdout.write(JSON.stringify({id:x.id,result:{}})+'\\n');process.stdout.write('{bad\\n');process.stdout.write(JSON.stringify({noise:'X'.repeat(2000)})+'\\n');process.stdout.write(JSON.stringify({id:999,result:{prompt:'RESPONSE_PRIVATE'}})+'\\n');if(x.method==='account/read')return process.stdout.write(JSON.stringify({id:x.id,result:{account:{planType:'unknown-secret-plan'}}})+'\\n');process.stdout.write(JSON.stringify({id:x.id,result:{rateLimits:{limitId:'codex',primary:{windowDurationMins:'bad',usedPercent:1,prompt:'PRIVATE'}}}})+'\\n')})`,async({executable})=>{
   const report=await new QuotaReporter({command:executable,timeoutMs:2000,maxLineBytes:1024,clock:()=>NOW}).observe();assert.deepEqual(report,{observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'malformed_rate_limits',planType:null,windows:[]});assert.equal(JSON.stringify(report).includes('PRIVATE'),false);
 }));
+
+test('M4 App Server closed stdin is unavailable and cannot crash the Agent with an EPIPE',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-m4-epipe-')),executable=path.join(root,'codex');
+  await writeFile(executable,'#!/bin/sh\nIFS= read -r _\nexec 0<&-\nprintf \'%s\\n\' \'{"id":1,"result":{}}\'\nsleep 1\n');await chmod(executable,0o700);
+  const stdinErrors=[];
+  const spawnImpl=(...args)=>{const child=nodeSpawn(...args),emit=child.stdin.emit;child.stdin.emit=function(event,...values){if(event==='error')stdinErrors.push(values[0]?.code);return emit.call(this,event,...values);};return child;};
+  try {
+    const report=await new QuotaReporter({command:executable,timeoutMs:2000,clock:()=>NOW,spawnImpl}).observe();
+    assert.deepEqual(report,{observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'app_server_unavailable',planType:null,windows:[]});
+    assert.ok(stdinErrors.includes('EPIPE'),`expected EPIPE, received ${stdinErrors.join(',')||'none'}`);
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
 
 test('M4 quota normalization uses limitId+duration identity across slot reorder; duplicate/missing identity is explicit',()=>{
   const left=normalizeQuota({rateLimits:{limitId:'codex',primary:{windowDurationMins:300,usedPercent:1},secondary:{windowDurationMins:10080,usedPercent:2}}});
