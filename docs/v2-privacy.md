@@ -10,4 +10,6 @@ Existing files are baselined at installation. Recognized inherited histories are
 
 Collection is explicit opt-in per Device and Account Profile. Codex Meter does not discover, inspect, watch, baseline, modify, or report arbitrary Codex homes or launchers found on the computer. An unregistered environment remains outside Meter even when another environment on the same Device is tracked.
 
+The only revision-0 compatibility exception is the single default Codex home already recorded in an upgrading V2.0.x Agent's Meter configuration. This preserves an existing Meter-managed assignment and does not discover any other home or launcher. Imported explicit profiles suppress the fallback, and any applied declarative revision 1 or later, including an empty revision, disables it.
+
 For the Device's current Codex login, first binding starts at the current rollout EOF and does not modify existing Codex configuration, authentication, or session files. For a separate login, Meter creates only its own isolated home and launcher. Stopping tracking never deletes either kind of local environment.

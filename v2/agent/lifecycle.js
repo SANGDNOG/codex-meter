@@ -115,13 +115,12 @@ export async function uninstallInstalledAgent(configPath, config, { paths = life
   await rm(configPath, { force: true });
   const executable = process.env.CODEX_METER_EXECUTABLE || paths.executable;
   if (paths.platform === 'win32') {
-    // Keep the helper outside the application directory so it can remove that directory after this process exits.
+    // Keep the helper outside the application directory so it can remove the running executable after this process exits.
     const helper = path.join(os.tmpdir(), `codex-meter-uninstall-${process.pid}.cmd`);
-    await writeFile(helper, `@echo off\r\n:wait\r\ntasklist /FI "PID eq ${process.pid}" 2>NUL | find "${process.pid}" >NUL && (ping 127.0.0.1 -n 2 >NUL & goto wait)\r\ndel /F /Q "${executable}"\r\nrmdir /S /Q "${paths.state}"\r\ndel "%~f0"\r\n`, { mode: 0o600 });
+    await writeFile(helper, `@echo off\r\n:wait\r\ntasklist /FI "PID eq ${process.pid}" 2>NUL | find "${process.pid}" >NUL && (ping 127.0.0.1 -n 2 >NUL & goto wait)\r\ndel /F /Q "${executable}"\r\ndel "%~f0"\r\n`, { mode: 0o600 });
     await run('cmd.exe', ['/d', '/c', 'start', '""', '/b', helper]);
   } else {
     await rm(executable, { force: true });
-    if (path.resolve(configPath).startsWith(`${path.resolve(paths.state)}${path.sep}`)) await rm(paths.state, { recursive: true, force: true });
   }
   return { uninstalled: true };
 }

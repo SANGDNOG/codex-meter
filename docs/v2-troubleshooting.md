@@ -1,6 +1,6 @@
 # V2 troubleshooting
 
-- **Agent inactive:** run `codex-meter-agent status`; inspect the per-user systemd journal, LaunchAgent error log, or scheduled-task history. Re-run the Dashboard installer only with a fresh enrollment.
+- **Agent inactive:** run the installed Agent executable's `status` subcommand using its full platform path documented in [V2 Agent installation](v2-installation.md); inspect the per-user systemd journal, LaunchAgent error log, or scheduled-task history. Re-run the Dashboard installer only with a fresh enrollment.
 - **Pending events:** keep using Codex; the outbox survives restart. Check HTTPS, DNS, certificate trust, Device disabled state, and Server health. Do not delete `agent.db` to fix connectivity.
 - **No increment:** installation intentionally ignores old history; wait ~45 seconds after new work. Directories/files that are inherited or ambiguous can undercount safely. Check Codex session discovery without sharing paths or JSONL.
 - **Login required:** run the exact login command displayed for that Account Profile on the Device page. Do not copy authentication files between homes.

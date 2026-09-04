@@ -21,7 +21,8 @@ function exec(command, args, options = {}) {
 test('M6 maps only the three supported platform/architecture targets and per-user locations', () => {
   assert.equal(releaseTarget('linux','x64'),'linux-x64'); assert.equal(releaseTarget('darwin','arm64'),'macos-arm64'); assert.equal(releaseTarget('win32','x64'),'windows-x64');
   assert.throws(()=>releaseTarget('linux','arm64'),/unsupported/); assert.throws(()=>releaseTarget('darwin','x64'),/unsupported/); assert.throws(()=>releaseTarget('freebsd','x64'),/unsupported/);
-  assert.match(lifecyclePaths('linux',{},'/private/home').executable,/\.local[\\/]bin/);
+  assert.equal(lifecyclePaths('linux',{},'/private/home').executable,path.join('/private/home','.local','bin','codex-meter-agent'));
+  assert.equal(lifecyclePaths('darwin',{},'/private/home').executable,path.join('/private/home','Library','Application Support','Codex Meter','codex-meter-agent'));
   assert.match(lifecyclePaths('darwin',{},'/private/home').service,/LaunchAgents/);
   assert.match(lifecyclePaths('win32',{LOCALAPPDATA:'C:\\Users\\u\\AppData\\Local'},'C:\\Users\\u').executable,/CodexMeter[\\/]codex-meter-agent\.exe$/);
 });
@@ -73,19 +74,20 @@ test('M6 installer checksum mismatch refuses replacement, enrollment, and servic
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
-test('M6 status, atomic update, Windows replacement helper, and uninstall use mocked lifecycle commands', async () => {
-  const dir=await temp(); const state=path.join(dir,'state'); await mkdir(state); const executable=path.join(state,'agent'); const configPath=path.join(state,'agent.json'), db=path.join(state,'agent.db'); await writeFile(executable,'old'); await writeFile(configPath,'{}'); await writeFile(db,'db');
+test('M6 status, atomic update, Windows replacement helper, and non-destructive uninstall use mocked lifecycle commands', async () => {
+  const dir=await temp(); const state=path.join(dir,'state'); await mkdir(state); const executable=path.join(state,'agent'); const configPath=path.join(state,'agent.json'), db=path.join(state,'agent.db'),managedHome=path.join(state,'profiles','binding'),managedAuth=path.join(managedHome,'auth.json'),managedSession=path.join(managedHome,'sessions','rollout.jsonl'),launcher=path.join(state,'cx2');await mkdir(path.dirname(managedSession),{recursive:true});await writeFile(managedAuth,'credential sentinel');await writeFile(managedSession,'session sentinel');await writeFile(launcher,'launcher sentinel');await writeFile(executable,'old'); await writeFile(configPath,'{}'); await writeFile(db,'db');
   const paths={platform:'linux',state,executable,config:configPath,service:path.join(dir,'agent.service')}; await writeFile(paths.service,'service');
   const bytes=Buffer.from('new-agent'), manifest={version:'2.2.0',artifacts:{'linux-x64':{url:'agent',sha256:digest(bytes)}}}; let fetchCount=0; const commands=[]; const run=async(c,a)=>{commands.push([c,...a]);return c==='systemctl'&&a.includes('is-active')?'active\n':'';};
   try {
     assert.deepEqual(await serviceStatus(paths,run),{service:'active'});
     const result=await updateInstalledAgent({serverUrl:'https://meter.example'},{paths,platform:'linux',run,fetchImpl:async()=>++fetchCount===1?response(manifest):response(bytes),pid:123});
     assert.deepEqual(result,{version:'2.2.0',update:'installed'}); assert.equal(await readFile(executable,'utf8'),'new-agent'); assert.ok(commands.some(c=>c.join(' ').includes('--user restart')));
-    await uninstallInstalledAgent(configPath,{databasePath:db},{paths,run}); await assert.rejects(readFile(executable),{code:'ENOENT'}); assert.ok(commands.some(c=>c.join(' ').includes('disable --now')));
+    await uninstallInstalledAgent(configPath,{databasePath:db},{paths,run}); await assert.rejects(readFile(executable),{code:'ENOENT'});await stat(managedAuth);await stat(managedSession);await stat(launcher);assert.ok(commands.some(c=>c.join(' ').includes('disable --now')));
 
-    const winState=path.join(dir,'win'); await mkdir(winState); const winExe=path.join(winState,'agent.exe'); await writeFile(winExe,'old'); const winPaths={platform:'win32',state:winState,executable:winExe,config:path.join(winState,'agent.json'),task:'Codex Meter Agent'}; let n=0; const winCommands=[];
+    const winState=path.join(dir,'win'),winManaged=path.join(winState,'profiles','binding','sessions'),winAuth=path.join(winState,'profiles','binding','auth.json');await mkdir(winManaged,{recursive:true});const winExe=path.join(winState,'agent.exe'),winConfig=path.join(winState,'agent.json'),winDb=path.join(winState,'agent.db');await writeFile(winExe,'old');await writeFile(winConfig,'{}');await writeFile(winDb,'db');await writeFile(winAuth,'credential sentinel');await writeFile(path.join(winManaged,'rollout.jsonl'),'session sentinel');await writeFile(path.join(winState,'cx2.ps1'),'launcher sentinel');const winPaths={platform:'win32',state:winState,executable:winExe,config:winConfig,task:'Codex Meter Agent'}; let n=0; const winCommands=[];
     const winResult=await updateInstalledAgent({serverUrl:'https://meter.example'},{paths:winPaths,platform:'win32',pid:456,run:async(c,a)=>winCommands.push([c,...a]),fetchImpl:async()=>++n===1?response({version:'2.2.0',artifacts:{'windows-x64':{url:'agent.exe',sha256:digest(bytes)}}}):response(bytes)});
     assert.equal(winResult.update,'scheduled'); const helper=await readFile(`${winExe}.replace-456.cmd`,'utf8'); assert.match(helper,/tasklist/); assert.match(helper,/move \/Y/); assert.match(helper,/schtasks\.exe \/Run/); assert.equal(await readFile(winExe,'utf8'),'old'); assert.equal(winCommands[0][0],'cmd.exe');
+    await uninstallInstalledAgent(winConfig,{databasePath:winDb},{paths:winPaths,run:async(c,a)=>winCommands.push([c,...a])});const uninstallCommand=winCommands.filter(command=>command[0]==='cmd.exe').at(-1),uninstallHelper=uninstallCommand.at(-1),uninstallScript=await readFile(uninstallHelper,'utf8');assert.doesNotMatch(uninstallScript,/rmdir\s+\/S/i);await stat(winAuth);await stat(path.join(winManaged,'rollout.jsonl'));await stat(path.join(winState,'cx2.ps1'));await rm(uninstallHelper,{force:true});
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 

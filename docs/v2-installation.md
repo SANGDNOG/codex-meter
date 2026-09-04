@@ -17,7 +17,7 @@ The monitored machine needs Codex CLI and its own local Codex authentication, bu
 1. Choose **Add Device** and enter the Device name.
 2. Select the Account Profile to track. Choose **Use this device's current Codex login** for the normal single-login setup, or **Add another Codex login** for a separate environment.
 3. Run the displayed Linux, macOS, or Windows command.
-4. If the Device page shows **Login required**, run the exact `codex login` or generated launcher command shown there.
+4. If the Device page shows **Login required**, run the `codex login` or platform-specific generated launcher command shown there.
 
 Enrollment tokens are one-time, expire after about 15 minutes, and are exchanged for a Device credential during enrollment. The permanent credential is not included in the bootstrap URL or shown in the Dashboard.
 
@@ -25,7 +25,9 @@ Linux/macOS use the displayed `curl ... install.sh` command; Windows uses the di
 
 If installation fails while downloading the manifest or artifact, verify that all five files exist under the Server host's `./releases/`, that `sha256sum --check SHA256SUMS` succeeds there, and that the public release endpoint returns them. Do not bypass checksum validation or build platform binaries inside the Server image.
 
-Check with `codex-meter-agent status`. Upgrade with `codex-meter-agent update`; the replacement is checksum-verified and atomic (Windows schedules replacement after process exit). Remove with `codex-meter-agent uninstall --yes`. Uninstall removes local Agent state and service, not Server usage already accepted.
+Use the installed executable's full path for lifecycle commands: `$HOME/.local/bin/codex-meter-agent` on Linux, `$HOME/Library/Application Support/Codex Meter/codex-meter-agent` on macOS, or `$env:LOCALAPPDATA\CodexMeter\codex-meter-agent.exe` from Windows PowerShell. The `status`, `update`, and `uninstall --yes` subcommands are available. Updates are checksum-verified and atomic; Windows schedules replacement after process exit.
+
+Uninstall removes the local Agent service, executable, configuration, and Agent database. It preserves managed Codex homes, credentials, sessions, and generated launchers, and does not remove Server usage already accepted. Use **Stop tracking** instead when only one Account Profile should stop reporting.
 
 Never upload rollout JSONL or `auth.json` to install or debug Codex Meter.
 
@@ -40,6 +42,8 @@ An Account Profile is an administrator label, not a verified provider identity. 
 Adding or stopping an Account Profile is applied by the next Agent sync without editing `agent.json` or restarting the service. Stopping tracking leaves the Codex login, sessions, launcher, local home, Meter history, cursor, outbox, and quota history intact.
 
 Only environments explicitly selected in the Dashboard are eligible for collection. The Agent does not scan arbitrary launchers or Codex homes. Upgrade migration imports only profiles already present in Codex Meter's local configuration.
+
+Before a V2.0.x Agent receives its first declarative revision, revision 0 retains only the single default home already recorded in that Agent's Meter configuration. Imported explicit profiles suppress the global fallback. Applying any declarative revision 1 or later, including an empty revision, permanently disables the default fallback unless the Server explicitly binds that environment.
 
 ## Quota reporter command discovery
 

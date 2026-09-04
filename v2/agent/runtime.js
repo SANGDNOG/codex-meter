@@ -61,7 +61,7 @@ export class AgentRuntime {
     const legacyFallback=!Number.isSafeInteger(appliedRevision)||appliedRevision===0;
     this.collectors=assignments.length?assignments.map((entry)=>this.collectorFactory(entry)):
       (legacyFallback?[this.collectorFactory({localHome:this.config.codexHome,accountId:null})]:[]);
-    this.syncClient.configureProfiles(assignments);
+    this.syncClient.configureProfiles(assignments,{legacyFallback});
   }
   refreshWatchers(){
     for(const watcher of this.watchers)watcher.close();this.watchers=[];

@@ -172,6 +172,27 @@ test('Core runtime start leaves an absent default home untouched after declarati
   await runtime.start();assert.deepEqual(runtime.collectors,[]);assert.deepEqual(configured.at(-1),[]);await assert.rejects(stat(defaultHome));await runtime.stop();
 }));
 
+test('Core applied empty declarative config cannot resurrect the legacy quota reporter after restart',()=>tempDatabase(async({root,database})=>{
+  const config={serverUrl:'https://meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'untracked-default'),databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex'),maxBatchSize:100};
+  await applyDesiredConfiguration(database,config,desired(1,[]),{clock:()=>NOW});
+  database.prepare("INSERT INTO agent_state(key,value,updated_at) VALUES('is_quota_reporter','true',?) ON CONFLICT(key) DO UPDATE SET value='true'").run(new Date(NOW).toISOString());
+  const bodies=[],fetchImpl=async(_url,options)=>{bodies.push(JSON.parse(options.body));return new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],rejectedEvents:[],serverTime:new Date(NOW).toISOString(),isQuotaReporter:true,serverCapabilities:CAPS,agentConfiguration:null}),{status:200,headers:{'content-type':'application/json'}});};
+  const declarativeClient=new AgentSyncClient(database,config,{clock:()=>NOW,fetchImpl});
+  assert.equal(declarativeClient.quotaReporter,null);assert.equal(declarativeClient.legacyQuotaReporter,null);
+  const runtime=new AgentRuntime(database,config,{syncClient:declarativeClient,watchImpl:()=>{throw new Error('untracked default home must not be watched');}});
+  await runtime.start();await runtime.sync(true);await runtime.stop();assert.equal('quotaReport'in bodies[0],false);assert.equal('quotaReports'in bodies[0],false);await assert.rejects(stat(config.codexHome));
+
+  database.prepare("UPDATE agent_state SET value='0' WHERE key IN ('desired_config_revision','applied_config_revision')").run();
+  let observations=0;const legacyBodies=[];
+  const legacyClient=new AgentSyncClient(database,config,{clock:()=>NOW,quotaReporter:{async observe(){observations+=1;return{observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'not_authenticated',planType:null,windows:[]};}},fetchImpl:async(_url,options)=>{legacyBodies.push(JSON.parse(options.body));return new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],isQuotaReporter:true}),{status:200,headers:{'content-type':'application/json'}});}});
+  await legacyClient.sync({heartbeat:true});assert.equal(observations,1);assert.equal(legacyBodies[0].quotaReport.errorKind,'not_authenticated');
+
+  const importedHome=path.join(root,'imported'),importedConfig={...config,profiles:[{accountId:'personal',name:'Personal',codexHome:importedHome,codexExecutable:config.codexExecutable}]};await mkdir(importedHome);await importLegacyProfiles(database,importedConfig,{clock:()=>NOW,launcherExists:async()=>false});
+  let importedGlobalObservations=0,importedProfileObservations=0;const importedBodies=[];
+  const importedClient=new AgentSyncClient(database,importedConfig,{clock:()=>NOW,quotaReporter:{async observe(){importedGlobalObservations+=1;throw new Error('global legacy reporter must stay disabled');}},quotaReporterFactory:(entry)=>({accountId:entry.accountId,async observe(){importedProfileObservations+=1;return{accountId:entry.accountId,observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'not_authenticated',planType:null,windows:[]};}}),fetchImpl:async(_url,options)=>{importedBodies.push(JSON.parse(options.body));return new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],isQuotaReporter:true}),{status:200,headers:{'content-type':'application/json'}});}});
+  const importedRuntime=new AgentRuntime(database,importedConfig,{syncClient:importedClient,collectorFactory:(entry)=>({home:entry.localHome,accountId:entry.accountId,async reconcile(){}})});importedRuntime.installAssignments();await importedClient.sync({heartbeat:true});assert.equal(importedGlobalObservations,0);assert.equal(importedProfileObservations,1);assert.equal('quotaReport'in importedBodies[0],false);assert.deepEqual(importedBodies[0].quotaReports.map(report=>report.accountId),['personal']);
+}));
+
 test('Core default-home real rollout baselines old usage, uploads only new usage, and rebinds without reassignment',()=>tempDatabase(async({root,database})=>{
   const home=path.join(root,'.codex'),rollout=path.join(home,'sessions','2026','09','01','rollout-cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl');await mkdir(path.dirname(rollout),{recursive:true});await writeFile(rollout,META('cccccccc-cccc-4ccc-8ccc-cccccccccccc')+USAGE(100,0));await writeFile(path.join(home,'config.toml'),'theme = "safe"\n');await writeFile(path.join(home,'auth.json'),'opaque');
   const protectedBefore=await Promise.all(['config.toml','auth.json'].map(async name=>[name,await readFile(path.join(home,name),'utf8'),(await stat(path.join(home,name))).mtimeMs]));

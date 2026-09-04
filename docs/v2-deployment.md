@@ -4,23 +4,23 @@
 
 The Docker deployment serves Agent release assets from the host directory `./releases/`, mounted read-only at `/releases`. The Server does not build Agent binaries and does not download from GitHub at runtime.
 
-For the first Agent release, create and push the version tag from the commit to release:
+Create and push the version tag from the exact validated commit:
 
 ```sh
 git switch main
 git pull --ff-only origin main
-git tag v2-agent-2.0.1
-git push origin v2-agent-2.0.1
+git tag -a v2-agent-2.1.0 -m "Codex Meter Agent 2.1.0"
+git push origin v2-agent-2.1.0
 ```
 
 The `v2-agent-*` tag triggers `.github/workflows/release-v2.yml`. GitHub Actions builds native `linux-x64`, `windows-x64`, and `macos-arm64` Agent binaries, creates `manifest.json` and `SHA256SUMS`, verifies the checksums, and publishes all five files as GitHub Release assets.
 
-On the Server host, download that release into `./releases/`. This is a deployment-time action; the running Server needs no GitHub credentials or network access to GitHub.
+On a Linux Server host or WSL, download that release into `./releases/`. This is a deployment-time action; the running Server needs no GitHub credentials or network access to GitHub.
 
 ```sh
 mkdir -p releases
 cd releases
-release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.0.1'
+release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.0'
 for asset in \
   manifest.json \
   SHA256SUMS \
@@ -37,6 +37,8 @@ chmod 644 releases/*
 ```
 
 `sha256sum --check SHA256SUMS` must report all three Agent binaries as `OK` before deployment. Keep the filenames unchanged because `manifest.json` references them directly.
+
+On macOS, use `shasum -a 256 -c SHA256SUMS`. On native Windows, use WSL for the commands above or compare every binary with its `SHA256SUMS` entry using PowerShell `Get-FileHash -Algorithm SHA256`. Do not deploy from filenames alone.
 
 ## 2. Start the Server
 

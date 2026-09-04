@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { AGENT_VERSION } from './config.js';
 
 export const QUOTA_ERROR_KINDS = Object.freeze(['codex_not_found', 'app_server_timeout', 'app_server_unavailable', 'not_authenticated', 'malformed_rate_limits', 'ambiguous_limits']);
 const PLAN_TYPES = new Set(['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu']);
@@ -92,7 +93,7 @@ export class ReadOnlyAppServerClient {
       this.child.stdout?.on('data', (chunk) => this.#consume(chunk));
       this.child.once('error', (error) => this.#rejectAll(safeError(error, this.command)));
       this.child.once('exit', () => this.#rejectAll(new SafeAppServerError('app_server_unavailable')));
-      await this.#request('initialize', { clientInfo: { name: 'codex-meter-agent', title: 'Codex Meter Agent', version: '2.1.0-dev' }, capabilities: null });
+      await this.#request('initialize', { clientInfo: { name: 'codex-meter-agent', title: 'Codex Meter Agent', version: AGENT_VERSION }, capabilities: null });
       this.#write({ method: 'initialized', params: null });
     } catch (error) { throw safeError(error, this.command); }
   }

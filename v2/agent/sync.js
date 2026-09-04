@@ -35,10 +35,16 @@ export class AgentSyncClient {
   constructor(database, config, { fetchImpl = fetch, clock = Date.now, codexVersion = null, timeoutMs = 30_000, quotaReporter, quotaReporterFactory } = {}) {
     this.database = database; this.config = config; this.fetch = fetchImpl; this.clock = clock; this.codexVersion = codexVersion; this.timeoutMs = timeoutMs;
     this.quotaReporterFactory=quotaReporterFactory??((profile)=>new QuotaReporter({clock:this.clock,accountId:profile.accountId,codexHome:profile.localHome??profile.codexHome,command:profile.codexExecutable??this.config.codexExecutable??'codex'}));
-    this.quotaReporter = (config.profiles ?? []).length ? null : (quotaReporter ?? new QuotaReporter({ clock, command: config.codexExecutable ?? 'codex', codexHome: config.codexHome }));
-    this.configureProfiles((config.profiles??[]).map((profile)=>({...profile,localHome:profile.codexHome})));
+    this.legacyQuotaReporter=quotaReporter??null;this.quotaReporter=null;
+    const profiles=(config.profiles??[]).map((profile)=>({...profile,localHome:profile.codexHome}));
+    const appliedRevision=Number(database.prepare("SELECT value FROM agent_state WHERE key='applied_config_revision'").get()?.value??0);
+    this.configureProfiles(profiles,{legacyFallback:profiles.length===0&&(!Number.isSafeInteger(appliedRevision)||appliedRevision===0)});
   }
-  configureProfiles(profiles){this.profileQuotaReporters=profiles.map((profile)=>this.quotaReporterFactory(profile));if(profiles.length)this.quotaReporter=null;}
+  configureProfiles(profiles,{legacyFallback=false}={}){
+    this.profileQuotaReporters=profiles.map((profile)=>this.quotaReporterFactory(profile));
+    if(legacyFallback&&profiles.length===0){this.legacyQuotaReporter??=new QuotaReporter({clock:this.clock,command:this.config.codexExecutable??'codex',codexHome:this.config.codexHome});this.quotaReporter=this.legacyQuotaReporter;}
+    else this.quotaReporter=null;
+  }
   pending() { return this.database.prepare('SELECT COUNT(*) count FROM usage_outbox').get().count; }
   async sync({ heartbeat = false, health = { status: 'healthy' } } = {}) {
     const rows = outboxRows(this.database, this.config.maxBatchSize);

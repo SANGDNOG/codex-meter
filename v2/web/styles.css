@@ -468,8 +468,14 @@ textarea {
   flex-wrap: wrap;
 }
 
+.login-commands {
+  display: grid;
+  gap: 0.35rem;
+}
+
 .login-command {
-  display: flex;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
   align-items: center;
   gap: 0.45rem;
 }
@@ -478,6 +484,7 @@ textarea {
   border-radius: 4px;
   background: #e9eff1;
   padding: 0.2rem 0.4rem;
+  overflow-wrap: anywhere;
 }
 
 .coverage-band {

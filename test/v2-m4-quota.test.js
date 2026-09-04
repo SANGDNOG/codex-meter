@@ -9,6 +9,7 @@ import { MeterService, ServiceError } from '../v2/server/service.js';
 import { createV2Server } from '../v2/server/http.js';
 import { AgentSyncClient } from '../v2/agent/sync.js';
 import { normalizeQuota, QuotaReporter, ReadOnlyAppServerClient } from '../v2/agent/app-server.js';
+import { AGENT_VERSION } from '../v2/agent/config.js';
 
 const NOW = Date.parse('2026-08-30T12:00:00.000Z');
 
@@ -23,7 +24,7 @@ const normalFake = `const fs=require('node:fs');const readline=require('node:rea
 test('M4 App Server performs bounded correlated handshake and only fixed read-only operations', async()=>fakeAppServer(normalFake,async({executable,calls})=>{
   const previous=process.env.CALLS;process.env.CALLS=calls;
   try{const reporter=new QuotaReporter({command:executable,timeoutMs:2000,clock:()=>NOW});const result=await reporter.observe();assert.equal(result.status,'available');assert.deepEqual(result.windows.map(x=>[x.limitId,x.durationMinutes]),[['codex',300],['codex',10080]]);assert.equal(JSON.stringify(result).includes('PRIVATE'),false);
-    const sent=(await readFile(calls,'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(sent.map(x=>x.method),['initialize','initialized','account/read','account/rateLimits/read']);assert.equal(sent[0].id+1,sent[2].id);assert.deepEqual(sent[2].params,{refreshToken:false});assert.ok(sent.every(x=>!String(x.method).includes('login')&&!String(x.method).includes('logout')&&!String(x.method).includes('consume')&&!String(x.method).includes('reset')));
+    const sent=(await readFile(calls,'utf8')).trim().split('\n').map(JSON.parse);assert.deepEqual(sent.map(x=>x.method),['initialize','initialized','account/read','account/rateLimits/read']);assert.equal(sent[0].params.clientInfo.version,AGENT_VERSION);assert.equal(sent[0].id+1,sent[2].id);assert.deepEqual(sent[2].params,{refreshToken:false});assert.ok(sent.every(x=>!String(x.method).includes('login')&&!String(x.method).includes('logout')&&!String(x.method).includes('consume')&&!String(x.method).includes('reset')));
     assert.equal(typeof ReadOnlyAppServerClient.prototype.request,'undefined');
   }finally{if(previous===undefined)delete process.env.CALLS;else process.env.CALLS=previous;}
 }));

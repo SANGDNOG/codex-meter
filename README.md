@@ -1,527 +1,358 @@
 # Codex Meter
 
-## V2 (recommended)
+[Korean documentation](README.ko.md)
 
-V2 is the recommended architecture: one persistent per-user Agent on each monitored computer and one Node.js 24.15+ Server providing both the Dashboard and versioned API. Devices operate concurrently; there is no lease and no invented token quota. The Agent counts newly observed `token_count.lastUsage` events from installation onward and delivers a privacy-allowlisted numeric event through a crash-safe SQLite outbox.
+[![Tests](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml/badge.svg)](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Status:** the V2 MVP implementation, migrations, Dashboard, installers, Docker deployment, and release automation are present. Before a production rollout, run the [two-real-machine validation](docs/v2-validation.md) in your own Codex environment.
+Codex Meter is a self-hosted, privacy-preserving usage meter for teams that use the OpenAI Codex CLI across multiple Devices and Account Profiles.
 
-### Fast server start (Docker)
+Codex Meter V2.1 runs one background Agent on each registered Device. The Agent collects numeric token counters from explicitly selected Codex environments and sends them to one central Server. The Server provides the Dashboard, Account and Group attribution, quota observations, and historical usage.
+
+Codex Meter is not an official OpenAI billing product, identity provider, OAuth proxy, or quota enforcement system. Account Profiles are labels managed by the Codex Meter administrator. Codex Meter does not automatically identify which provider account is signed in.
+
+## What V2.1 provides
+
+- One persistent Agent per registered Device, with no wrapper required for normal Codex use.
+- Declarative Device configuration managed from the Dashboard and applied without editing `agent.json` or restarting the Agent.
+- A simple flow for tracking the Device's current Codex login.
+- Separate, isolated Codex environments for using multiple Account Profiles on one Device.
+- Automatic per-user service and launcher creation on supported platforms.
+- Explicit opt-in tracking: only environments selected in Codex Meter are collected.
+- Per-Account, per-Device, and historical Group usage attribution.
+- Read-only provider quota observations with stale and unavailable states.
+- Estimated quota contribution based on locally tracked token shares.
+- Crash-safe cursors, an SQLite outbox, at-least-once delivery, and Server-side deduplication.
+- Zero-touch migration for environments that were already managed by Codex Meter.
+
+## Tracking boundary
+
+Codex Meter measures only Codex environments that an administrator explicitly binds to a Meter Account Profile on a Device.
+
+For example, a computer may contain three launchers:
+
+```text
+cx1 -> Account A
+cx2 -> Account B
+cx3 -> Account C
+```
+
+If only `Personal -> cx1` is registered in Codex Meter, only that environment receives a collector, watcher, quota reporter, and Server attribution. `cx2` and `cx3` remain outside Codex Meter.
+
+For an untracked environment, Codex Meter does not:
+
+- scan or inspect its Codex home;
+- read its authentication state;
+- create a baseline or managed marker;
+- modify `config.toml`, authentication, or session files;
+- start a collector, watcher, or quota reporter; or
+- report its path, launcher, account, or usage to the Server.
+
+The existence of a launcher or `CODEX_HOME` directory is not consent to track it. Legacy migration imports only environments already present in Codex Meter's own local configuration.
+
+One compatibility case is intentional: before the first declarative configuration is applied, a revision-0 V2.0.x Agent continues tracking the single default Codex home already recorded in its Meter configuration. This preserves an existing Meter-managed assignment; it is not machine-wide discovery. Imported explicit profiles take precedence over that fallback. After any declarative revision 1 or later is applied, including an empty revision, the default fallback is disabled.
+
+## Architecture
+
+```text
+Explicitly selected Codex environment
+  -> local rollout parser
+  -> transactional cursor + SQLite outbox
+  -> HTTPS Agent sync
+  -> Codex Meter Server
+  -> Account / Device / Group views
+
+Codex App Server (read-only operations)
+  -> normalized quota observation
+  -> HTTPS Agent sync
+  -> Account quota and cycle estimate
+```
+
+The Agent watches active and archived rollout files and periodically reconciles them. It parses only allowlisted `token_count.lastUsage` fields. Cursor advancement and outbox insertion are one transaction. Stable event IDs and a Server uniqueness constraint prevent duplicate counting during retries or restarts.
+
+The Server is a single Node.js 24.15+ process serving the Dashboard and `/api/v1/**`. It stores data in a WAL-mode SQLite database with versioned migrations. Run only one Server process against a database.
+
+See [V2 architecture](docs/v2-architecture.md) for data and attribution semantics.
+
+## Supported platforms
+
+| Component | Supported environment |
+| --- | --- |
+| Server | Docker with Node.js 24.15+, or Node.js 24.15+ directly |
+| Agent | Linux x64 |
+| Agent | macOS arm64 |
+| Agent | Windows x64 |
+
+Released Agents are self-contained executables. Monitored computers need the Codex CLI, but do not need a global Node.js installation, npm, or a repository checkout.
+
+## User onboarding
+
+Normal onboarding takes at most four actions:
+
+1. Select **Add Device** in the Dashboard.
+2. Select the Account Profile to track and the login type.
+3. Run the displayed installation command.
+4. If the Device reports **Login required**, run the exact login command shown on its detail page.
+
+The user does not enter Account UUIDs, create a `CODEX_HOME`, edit JSON, copy binding IDs, or restart a service manually.
+
+### Use this Device's current Codex login
+
+Choose this for the normal one-login setup. The Server declares the Account Profile but does not receive a local path. The Agent adopts the operating system's default Codex home.
+
+At the first binding, the Agent records the current end of every existing rollout as its baseline. Historical usage is not imported. Only events written after the binding are attributed to the selected Account Profile.
+
+The Agent does not modify the adopted home's `config.toml`, authentication files, sessions, or directory ownership, and it does not create a managed marker there.
+
+### Add another Codex login
+
+Choose this when the same Device needs another explicitly tracked Account Profile. The Agent creates:
+
+- a private Meter-managed Codex home;
+- a managed ownership marker inside that home;
+- the required credential-store configuration;
+- a safe logical launcher such as `cx2`; and
+- the collector, watcher, and quota reporter for that assignment.
+
+The Device page displays commands for each supported operating system when authentication is required. Use the command for that Device:
+
+```sh
+# Linux
+"$HOME/.local/bin/cx2" login
+
+# macOS
+"$HOME/Library/Application Support/Codex Meter/cx2" login
+```
+
+```powershell
+# Windows PowerShell
+& "$env:LOCALAPPDATA\CodexMeter\cx2.ps1" login
+```
+
+Codex Meter never signs in automatically and never asks for or copies provider credentials.
+
+### Add, rebind, and stop tracking
+
+Adding an Account Profile or stopping tracking creates a new desired configuration revision. A running Agent applies it during its next sync. Healthy existing assignments continue while a failed revision is reported as `apply_failed`.
+
+**Stop tracking** stops future collection, watching, and quota reporting for that binding. It does not delete the local Codex login, Codex home, launcher, sessions, historical Meter usage, cursor, pending outbox records, or quota history.
+
+If an Account Profile is rebound, events before the transition remain attributed to the previous binding. The new binding starts at the transition baseline and does not reassign old usage.
+
+## Dashboard states
+
+The Device page is the control center for tracked Account Profiles. It distinguishes:
+
+- waiting for the Agent;
+- applying configuration;
+- tracking;
+- login required;
+- quota unavailable;
+- Agent offline;
+- configuration apply failed; and
+- stop tracking pending.
+
+The Account page shows measured usage, current quota, registered Device coverage, Device breakdown, historical Group attribution, and current-cycle estimates. A failed configuration does not hide assignments that remain active under the last-known-good revision.
+
+## Server deployment
+
+### Requirements
+
+- Docker with Compose, or Node.js 24.15 or newer.
+- A persistent directory or volume for `/data/meter.db`.
+- A public HTTPS origin for enrollment and Agent sync.
+- All five files from one `v2-agent-*` GitHub Release in the release directory.
+- A long, unique administrator password supplied through the environment.
+
+### Download one complete Agent release
+
+Do not mix a manifest and binaries from different releases. The following staging commands target a Linux Server host or WSL:
+
+```sh
+mkdir -p releases
+cd releases
+release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.0'
+for asset in \
+  manifest.json \
+  SHA256SUMS \
+  codex-meter-agent-linux-x64 \
+  codex-meter-agent-windows-x64.exe \
+  codex-meter-agent-macos-arm64
+do
+  curl -fSLO "$release_url/$asset"
+done
+sha256sum --check SHA256SUMS
+cd ..
+chmod 755 releases
+chmod 644 releases/*
+```
+
+All three binary checks must report `OK` before deployment.
+
+On a macOS Server host, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum --check SHA256SUMS`. On a native Windows Server host, use WSL for the block above or validate every binary against the corresponding value in `SHA256SUMS` with PowerShell `Get-FileHash -Algorithm SHA256` before starting the Server.
+
+### Start with Docker Compose
 
 ```sh
 cp compose.v2.example.yml compose.yml
-mkdir -p releases
-# Download manifest.json, SHA256SUMS, and all three native Agent artifacts
-# from one v2-agent-* GitHub Release into ./releases/, then verify them:
-(cd releases && sha256sum --check SHA256SUMS)
 export CODEX_METER_ADMIN_PASSWORD='replace-with-a-long-random-password'
 export CODEX_METER_SERVER_URL='https://meter.example.com'
-export CODEX_METER_TRUSTED_PROXIES='127.0.0.1,::1' # exact reverse-proxy backend source IP(s)
+export CODEX_METER_TRUSTED_PROXIES='127.0.0.1,::1'
 docker compose up -d --build
+docker compose ps
 curl -fsS http://127.0.0.1:3000/api/v1/health
 curl -fsS http://127.0.0.1:3000/api/v1/agent/releases/manifest.json
 ```
 
-The Compose example sets `CODEX_METER_RELEASE_DIR=/releases` and mounts host `./releases` at `/releases:ro`; Dashboard one-line installers depend on those release assets. The complete first-release tagging, asset download, checksum, and endpoint-verification procedure is in [V2 Server deployment](docs/v2-deployment.md).
+The example binds port 3000 to loopback, mounts the SQLite volume at `/data`, and mounts `./releases` read-only at `/releases`.
 
-Put an HTTPS reverse proxy in front of the loopback-bound port. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and list the proxy's exact backend source IP in `CODEX_METER_TRUSTED_PROXIES` (Docker bridge/NAT deployments may not appear as loopback). Plaintext enrollment and Agent sync are rejected with HTTP 426. The single service stores its WAL-mode SQLite database at `/data/meter.db`; back up that file using a SQLite-safe backup or a stopped-container copy.
+Place a trusted HTTPS reverse proxy in front of the Server. Preserve `Host`, set exactly `X-Forwarded-Proto: https`, and add only the proxy's exact backend source IP to `CODEX_METER_TRUSTED_PROXIES`. CIDRs and arbitrary forwarded headers are not trusted. Direct plaintext enrollment and sync requests are rejected.
 
-### Add a Device
+See [V2 Server deployment](docs/v2-deployment.md) for release serving, backup, restore, and reverse-proxy requirements.
 
-1. Choose **Add Device** in the Dashboard.
-2. Select the Account Profile to track and whether it uses the Device's current Codex login or a separate login.
-3. Run the displayed Linux, macOS, or Windows install command.
-4. If the Device shows **Login required**, run the exact login command shown there.
+### Start directly with Node.js
 
-No Account UUID, local path, JSON edit, or manual service restart is required. Released Agents are self-contained and require no global Node.js or npm on monitored computers.
-
-Codex Meter tracks only Codex environments explicitly added to a Device. Other launchers, accounts, and `CODEX_HOME` directories on the same computer remain untouched and are not reported to the Server.
-
-### V2 semantics and caveats
-
-- Account quota reporting is **read-only, optional, and may be stale or unavailable**. It is never estimated from token counts.
-- Estimated quota contribution allocates provider-reported usage in proportion to locally tracked tokens. It is explicitly an estimate, not provider-attributed usage.
-- Group percentage is the **share of locally measured token usage**, not exact OpenAI quota attribution or billing.
-- Never upload Codex rollout JSONL or `auth.json`, including in support requests.
-- Recognized inherited fork/subagent/revert history is skipped. Ambiguous inherited files are baselined, so they **undercount safely** rather than risk double-counting.
-- SQLite is a **single-service MVP**. Do not run multiple Server replicas against `/data/meter.db`; no Redis, PostgreSQL, or queue is required.
-
-V2 documentation: [architecture](docs/v2-architecture.md), [installation](docs/v2-installation.md), [deployment](docs/v2-deployment.md), [validation](docs/v2-validation.md), [privacy](docs/v2-privacy.md), and [troubleshooting](docs/v2-troubleshooting.md).
-
----
-
-## V1 legacy wrapper documentation
-
-Everything below describes V1. V1 remains tested for compatibility but is legacy: it requires launching Codex through a wrapper, assumes exactly three users, and uses leases/operator-defined quota behavior that V2 deliberately does not use.
-
-[![Node.js 22](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Tests](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml/badge.svg)](https://github.com/SANGDNOG/codex-meter/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-Codex Meter is a small, dependency-free quota and usage meter for **exactly three people** who each run and authenticate their own local [OpenAI Codex CLI](https://github.com/openai/codex).
-
-It is **not an OpenAI plugin, OAuth proxy, or official billing tool**. It is a cooperative local wrapper plus a central Node.js server.
-
-> 한국어 요약: 세 사람이 각자 본인의 Codex CLI와 계정을 그대로 사용하면서, 중앙 서버에서 사용량을 집계하고 필요할 때만 같은 한도를 적용하는 도구입니다. 프롬프트·응답·소스 코드·Codex 인증정보는 서버로 보내지 않고 숫자 토큰 카운터 5개만 전송합니다.
-
-## 한국어 안내
-
-### 어떤 도구인가요?
-
-Codex Meter는 **세 명이 각자 개인 컴퓨터의 터미널에서 Codex CLI를 실행하되, 사용량은 중앙에서 사용자별로 집계하고 선택적으로 같은 쿼터를 적용**하기 위한 도구입니다.
-
-실제 구성은 다음 두 부분으로 나뉩니다.
-
-1. **개인 컴퓨터의 래퍼**가 Codex CLI를 대신 실행합니다.
-2. **중앙 Meter 서버**가 세 사용자의 사용량, 쿼터, 실행 상태를 관리합니다.
-
-```text
-사용자 A/B/C의 개인 터미널
-  └─ Codex Meter 래퍼
-       ├─ 중앙 서버에 실행 허가 요청
-       ├─ 본인 컴퓨터의 Codex CLI 실행
-       ├─ 로컬 세션에서 token_count만 집계
-       └─ 세션에서 추출한 숫자 사용량 5개만 중앙 서버에 보고
-
-중앙 Meter 서버
-  ├─ 사용자별 누적 사용량
-  ├─ 관찰 모드 또는 세 명에게 동일한 쿼터 적용
-  ├─ 사용자당 동시 실행 1개 제한
-  ├─ 강제 모드의 쿼터 초과·모든 모드의 비활성 사용자 차단
-  └─ 사용자용 조회 API와 관리자 대시보드
-```
-
-이 프로젝트는 **OpenAI 공식 플러그인이나 공식 사용량·과금 도구가 아닙니다.** Codex 앞에서 실행되는 협력형 로컬 래퍼와 별도의 중앙 관리 서버입니다.
-
-### 사용량은 자동으로 수집됩니다
-
-사용자가 토큰 수치나 사용 내역을 직접 입력할 필요는 없습니다. 사용자에게 필요한 수동 설정은 최초 한 번 `client.json`에 중앙 서버 주소와 본인의 Meter 토큰을 저장하는 것뿐입니다.
-
-이후 Codex Meter 래퍼를 실행할 때마다 다음 과정이 자동으로 진행됩니다.
-
-1. 중앙 서버에 실행 가능 여부를 확인하고 사용자 lease를 받습니다.
-2. 래퍼가 같은 터미널에서 사용자의 로컬 Codex CLI를 실행합니다.
-3. 기본 **5초 간격**으로 로컬 Codex 세션 JSONL을 다시 확인합니다.
-4. 새로 발생한 `token_count`의 다섯 카운터 차이를 자동 계산해 중앙 서버에 전송합니다.
-5. 강제 모드에서는 쿼터 초과 응답을 받으면 실행 중인 Codex를 중지합니다. 관찰 모드에서는 사용량만 기록합니다.
-6. Codex가 끝나면 최종 사용량과 실행 종료를 자동 보고합니다.
-7. 일시적인 전송 실패는 로컬 spool에 보관했다가 다음 실행 때 자동 재전송합니다.
-
-따라서 `/v1/usage` 호출이나 관리자 대시보드는 **사용량을 입력하는 기능이 아니라 이미 자동 수집된 결과를 조회하는 기능**입니다. 다만 계량이 적용되려면 사용자가 원본 `codex` 대신 Codex Meter 래퍼를 통해 실행해야 합니다.
-
-### 개인정보와 인증정보
-
-각 사용자는 자신의 컴퓨터에 Codex CLI를 설치하고 직접 인증합니다. Codex Meter는 Codex OAuth 토큰과 `auth.json`을 읽거나 복사하거나 서버로 보내지 않습니다.
-
-래퍼는 로컬 Codex 세션 JSONL을 한 줄씩 읽고 각 레코드를 파싱해 `token_count` 이벤트인지 확인합니다. 프롬프트·응답·도구 실행·소스 내용 등 `token_count`가 아닌 레코드는 로컬에서 즉시 버리며, 저장하거나 중앙 서버로 전송하지 않습니다. 세션에서 추출해 전송하는 사용량 정보는 다음 숫자 5개뿐입니다.
-
-- `input_tokens`
-- `cached_input_tokens`
-- `output_tokens`
-- `reasoning_output_tokens`
-- `total_tokens`
-
-Meter 서버용 사용자 토큰은 Codex 인증정보와 완전히 별개입니다. 서버 상태에는 평문 토큰 대신 SHA-256 해시만 저장됩니다.
-
-### 필요한 환경
-
-- 중앙 서버와 각 사용자 컴퓨터에 **Node.js 22 이상**
-- 각 사용자 컴퓨터에 공식 Codex CLI 설치 및 로컬 인증
-- 원격 연결 시 HTTPS 리버스 프록시, VPN 또는 SSH 터널
-- 정확히 세 개의 고유한 Meter 사용자 ID
-
-외부 런타임 패키지가 없으므로 `npm install`은 필요하지 않습니다.
-
-### 1. 중앙 서버 설치
+For a direct deployment, install production dependencies and provide the same release directory explicitly:
 
 ```sh
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-node --version
+npm ci --omit=dev
+mkdir -p data releases
+export CODEX_METER_ADMIN_PASSWORD='replace-with-a-long-random-password'
+export CODEX_METER_SERVER_URL='https://meter.example.com'
+export CODEX_METER_TRUSTED_PROXIES='127.0.0.1,::1'
+export CODEX_METER_DB="$PWD/data/meter.db"
+export CODEX_METER_RELEASE_DIR="$PWD/releases"
+export CODEX_METER_HOST='127.0.0.1'
+export CODEX_METER_PORT='3000'
+node bin/v2-server.js
+```
+
+Populate and verify `releases` before starting. Run the process under one service supervisor, keep it bound behind the HTTPS reverse proxy, and never start a second process against the same SQLite database.
+
+## Create the first Device
+
+1. Open the public HTTPS Server URL and sign in with the administrator password.
+2. Create the Account Profiles and Groups needed by your organization.
+3. Open **Devices**, select **Add Device**, enter a Device name, and select one Account Profile.
+4. Choose the current-login or separate-login option and create the Device.
+5. Run the generated command on that Device.
+6. Wait for **Tracking** or follow the exact **Login required** command.
+
+The enrollment token in the command is short-lived and one-time. The Server stores only its hash. Successful enrollment exchanges it for a Device credential, which is stored in a permission-restricted local Agent configuration and is never placed in a URL query.
+
+## Agent operations
+
+The installer registers a per-user systemd service, LaunchAgent, or least-privilege Windows scheduled task. Use the installed executable's full path so the commands also work when its directory is not in `PATH`.
+
+```sh
+# Linux
+"$HOME/.local/bin/codex-meter-agent" status
+"$HOME/.local/bin/codex-meter-agent" update
+
+# macOS
+"$HOME/Library/Application Support/Codex Meter/codex-meter-agent" status
+"$HOME/Library/Application Support/Codex Meter/codex-meter-agent" update
+```
+
+```powershell
+# Windows PowerShell
+& "$env:LOCALAPPDATA\CodexMeter\codex-meter-agent.exe" status
+& "$env:LOCALAPPDATA\CodexMeter\codex-meter-agent.exe" update
+```
+
+`update` downloads the manifest and target binary from the configured Server, verifies SHA-256, and replaces the executable atomically. A failed verification leaves the existing executable in place.
+
+Use **Stop tracking** when the goal is only to stop measuring an Account Profile. The `uninstall --yes` subcommand removes the Agent service, executable, configuration, and Agent database. It intentionally preserves managed Codex homes, credentials, sessions, and generated launchers so uninstall cannot delete Codex data. Those preserved environments are no longer tracked.
+
+## Usage and attribution
+
+Codex Meter records canonical decimal-string counters for input, cached input, optional cache-write input, output, reasoning output, and total tokens. `totalTokens` is the displayed total; the other dimensions are not added to it again.
+
+- **Account attribution** comes from the explicit Account Profile binding at event time.
+- **Device attribution** comes from the enrolled Agent credential.
+- **Group attribution** uses the Device's historical Group membership at `occurredAt`, not upload time.
+- **Offline usage** remains in the local outbox and is replayed after reconnection.
+- **Duplicate delivery** is accepted idempotently and does not increase totals twice.
+
+Moving a Device between Groups does not rewrite historical usage. Delayed events are assigned to the Group that owned the Device when the event occurred.
+
+## Quota and estimated contribution
+
+Quota reporting is read-only, optional, and separate from measured tokens. The designated Agent uses fixed Codex App Server operations to initialize, read account availability, and read rate limits. Codex Meter does not implement a token-to-provider-quota conversion.
+
+The Dashboard shows:
+
+- provider-reported usage and reset time;
+- locally tracked tokens;
+- the tracked share by Group;
+- tracking coverage for explicitly registered Devices; and
+- estimated quota contribution.
+
+Estimated quota contribution allocates the provider-reported Account usage in proportion to locally tracked token usage. It is an estimate, not provider-attributed exact usage or billing data.
+
+If tracking starts during an existing provider cycle, coverage is `partial`. Codex Meter records the provider percentage as a baseline and allocates only the percentage-point change observed after tracking began. It does not allocate the entire current provider percentage to newly tracked usage.
+
+Computers or environments that were never registered are not included in the tracking-coverage denominator.
+
+## Privacy and security
+
+The local parser uses an explicit allowlist. It may transmit the event timestamp, numeric token counters, and bounded optional model or reasoning metadata. It does not persist or transmit prompts, responses, messages, source code, tool arguments, tool output, working directories, repository names, arbitrary rollout fields, OAuth credentials, or `auth.json`.
+
+Additional protections include:
+
+- HTTPS required for enrollment and Agent sync;
+- short-lived, single-use enrollment tokens stored as hashes;
+- hashed administrator passwords and Device secrets on the Server;
+- permission-restricted Agent configuration and state;
+- no remote filesystem paths, executables, commands, scripts, or environment variables in declarative configuration;
+- fixed read-only quota operations; and
+- no automatic discovery of local Codex environments.
+
+Never upload rollout JSONL, `auth.json`, Device credentials, or administrator credentials in bug reports, CI artifacts, or support requests. See [V2 privacy model](docs/v2-privacy.md).
+
+## Backup and recovery
+
+Back up the production SQLite database before every Server upgrade. Use SQLite's online backup API/tool, or stop only the Codex Meter Server and copy `meter.db` with any WAL sidecars as one consistent unit. Verify backup integrity and test restoration.
+
+A rollback across schema versions means restoring both the previous Server runtime and the matching pre-upgrade database backup. Do not run an older Server against a migrated database unless compatibility has been explicitly proven.
+
+The Agent preserves cursors and pending outbox events across normal restarts. Do not delete `agent.db` to resolve connectivity issues.
+
+## Troubleshooting
+
+- **Agent inactive:** run the platform-specific `status` command shown under Agent operations, then inspect the per-user service log.
+- **Login required:** run the exact command shown on the Device page. Do not copy authentication files between homes.
+- **No usage increment:** installation intentionally excludes old history; allow one reconciliation and sync interval after new work.
+- **Pending events:** check HTTPS, DNS, certificate trust, Device status, and Server health. The outbox retries automatically.
+- **Configuration apply failed:** the previous healthy configuration remains active. Resolve the reported local filesystem or launcher conflict and allow the Agent to retry.
+- **Quota unavailable or stale:** verify that an enabled registered Device is reporting and that its Codex login is usable. Do not interpret stale quota as current.
+- **Server restart loop:** verify the first-start administrator password, volume ownership, disk space, and that only one Server writes the database.
+- **Checksum failure:** keep the current Agent executable, verify the complete release directory, and retry. Never bypass verification.
+
+See [V2 troubleshooting](docs/v2-troubleshooting.md) for operational details.
+
+## Development and validation
+
+Use Node.js 24.15 or newer:
+
+```sh
+npm ci
 npm test
+npm run test:v1
+npm run test:v2
+npm run check:syntax
+sh -n v2/install/install.sh
+npm audit --omit=dev
 ```
 
-세 명의 사용량을 대략 비교하는 목적이라면 **관찰 전용 모드**로 최초 한 번 초기화합니다. 이 모드는 토큰을 기록하지만 임의의 토큰 한도로 Codex를 중지하지 않습니다.
+Release tags matching `v2-agent-*` trigger native Linux x64, Windows x64, and macOS arm64 builds, standalone executable smoke tests, deterministic manifest generation, checksum verification, and GitHub Release publication.
 
-```sh
-export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
-umask 077
-node bin/admin.js init \
-  --users=alice,bob,carol \
-  --observe-only \
-  --reset-ms=2592000000 \
-  --max-leases=1 \
-  --lease-ttl-ms=120000 \
-  > meter-tokens-once.json
-```
+Real-environment validation must never copy or inspect `auth.json`. Follow the [V2 validation guide](docs/v2-validation.md).
 
-예시는 30일마다 측정 카운터만 초기화합니다. 강제 토큰 정책이 필요할 때만 `--observe-only` 대신 `--quota=원하는_양의_정수`를 사용하세요. 이 값은 OpenAI 플랜 한도가 아니라 운영자가 정하는 로컬 정책입니다.
+## Legacy V1
 
-`meter-tokens-once.json`에는 관리자 토큰 1개와 사용자 토큰 3개가 **최초 한 번만 평문으로 출력**됩니다. 각 사용자에게 본인의 토큰만 안전한 방법으로 전달한 뒤 파일을 안전하게 삭제하세요. 토큰을 잃어버리면 해시에서 복구할 수 없으므로 새 상태를 초기화해야 합니다.
+V1 remains in the repository for compatibility testing. It uses a foreground wrapper, exactly three configured users, leases, and an optional operator-defined token quota. These behaviors do not describe V2.1. New deployments should use V2.1.
 
-서버를 로컬 주소에서 실행합니다.
+## License
 
-```sh
-CODEX_METER_HOST=127.0.0.1 \
-CODEX_METER_PORT=8787 \
-node bin/server.js
-```
-
-상태 확인:
-
-```sh
-curl http://127.0.0.1:8787/health
-```
-
-평문 HTTP 서버를 신뢰할 수 없는 네트워크에 직접 공개하지 마세요. 원격 사용자는 HTTPS, VPN 또는 SSH 터널을 통해 접속해야 합니다.
-
-### 2. macOS·Linux 사용자 설정
-
-각 사용자 컴퓨터에서 저장소를 받고 개인 설정 파일을 만듭니다.
-
-```sh
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-mkdir -p "$HOME/.codex-meter"
-chmod 700 "$HOME/.codex-meter"
-cat > "$HOME/.codex-meter/client.json" <<'JSON'
-{
-  "serverUrl": "https://meter.example.internal/",
-  "meterToken": "본인에게_발급된_METER_TOKEN",
-  "pollIntervalMs": 5000
-}
-JSON
-chmod 600 "$HOME/.codex-meter/client.json"
-chmod +x clients/unix/codex-meter
-mkdir -p "$HOME/.local/bin"
-ln -s "$(pwd)/clients/unix/codex-meter" "$HOME/.local/bin/codex-meter"
-```
-
-이제 원래 `codex`를 실행하던 자리에 래퍼를 사용합니다.
-
-```sh
-/path/to/codex-meter/clients/unix/codex-meter
-/path/to/codex-meter/clients/unix/codex-meter --model MODEL_NAME "작업 내용"
-codex-meter
-```
-
-### 3. Windows PowerShell 사용자 설정
-
-```powershell
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-New-Item -ItemType Directory -Force "$HOME\.codex-meter" | Out-Null
-@'
-{
-  "serverUrl": "https://meter.example.internal/",
-  "meterToken": "본인에게_발급된_METER_TOKEN",
-  "pollIntervalMs": 5000
-}
-'@ | Set-Content -Encoding utf8 "$HOME\.codex-meter\client.json"
-```
-
-PowerShell 래퍼로 Codex를 실행합니다.
-
-```powershell
-powershell -NoProfile -File .\clients\windows\codex-meter.ps1
-powershell -NoProfile -File .\clients\windows\codex-meter.ps1 --model MODEL_NAME "작업 내용"
-```
-
-PowerShell 래퍼와 Node.js 래퍼는 인수를 배열로 전달하며 `cmd.exe`를 호출하지 않습니다. 기본적으로 네이티브 `codex.exe`를 우선 사용합니다. 표준 npm 설치의 `codex.cmd`만 있으면 인접한 공식 `@openai/codex/bin/codex.js`를 Node.js로 직접 실행합니다. 설치 위치가 특수하면 `CODEX_METER_CODEX`에 `.cmd`가 아닌 네이티브 `codex.exe` 전체 경로를 지정하세요.
-
-### 4. 사용량 확인과 사용자 관리
-
-브라우저에서 서버 루트 주소를 열고 자신의 Meter 토큰을 입력하면 본인 사용량만 조회할 수 있습니다. 이 토큰은 OpenAI API 키가 아니라 서버 초기화 때 별도로 발급되는 Meter 전용 자격 증명이며, 웹 화면은 토큰을 URL·쿠키·브라우저 저장소에 보관하지 않습니다.
-
-```sh
-curl --oauth2-bearer USER_METER_TOKEN \
-  https://meter.example.internal/v1/usage
-```
-
-관리자는 같은 루트 화면의 관리자 로그인에 Admin Meter 토큰을 입력해 전체 대시보드를 조회하거나, 인증된 JSON API를 사용할 수 있습니다.
-
-```sh
-curl --oauth2-bearer ADMIN_METER_TOKEN \
-  https://meter.example.internal/admin.json
-```
-
-사용자를 비활성화하거나 다시 활성화할 때는 경쟁 상태를 피하기 위해 먼저 서버를 중지한 뒤 실행합니다.
-
-```sh
-export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
-node bin/admin.js set-enabled alice false
-node bin/admin.js set-enabled alice true
-```
-
-### 네트워크 장애와 제한 사항
-
-- 실행 전 중앙 서버에 연결할 수 없으면 Codex 실행을 시작하지 않습니다.
-- 정상적으로 시작한 뒤 일시적인 네트워크 장애가 발생하면 로컬 Codex는 계속 실행됩니다.
-- 전송하지 못한 숫자 사용량은 개인 컴퓨터의 비공개 spool 파일에 저장했다가 다음 실행 때 다시 전송합니다.
-- 인증 실패나 잘못된 요청 같은 영구적인 HTTP 4xx 오류가 발생하면 래퍼가 Codex 실행을 중지합니다.
-- 온라인 상태에서도 파일 확인 주기만큼 쿼터를 조금 초과할 수 있습니다.
-- 서버나 네트워크가 끊긴 동안에는 중앙 차단을 적용할 수 없어 초과량이 커질 수 있습니다.
-- 사용자가 원본 `codex`를 직접 실행하거나 로컬 프로그램을 수정하면 계량을 우회할 수 있습니다. 따라서 이 도구는 세 사용자가 래퍼 사용에 동의하는 **협력형 계량 방식**입니다.
-- Codex 세션 삭제·손상, 갑작스러운 전원 차단, 향후 세션 형식 변경은 측정 정확도를 낮출 수 있습니다.
-- 표시되는 사용량은 OpenAI의 공식 Pro/Codex 잔여량이나 청구 사용량이 아닙니다.
-
----
-
-## English documentation
-
-## What it does
-
-```text
-Each user's computer                         Central meter server
-┌─────────────────────────────┐              ┌──────────────────────────┐
-│ own Codex CLI + own OAuth   │              │ three meter identities   │
-│             │               │              │ equal shared policy      │
-│ Codex Meter wrapper         │── 5 counters→│ quota + active lease     │
-│ reads local token_count only│← allow/stop ─│ usage API + admin view   │
-└─────────────────────────────┘              └──────────────────────────┘
-```
-
-- Requires **exactly three unique meter users**.
-- Supports observe-only measurement or one configurable quota applied equally to all three users; both modes use the same reset period.
-- Allows one active wrapper per user.
-- Denies a new run when the user is disabled or already active; enforcement mode also denies users who are out of quota.
-- In enforcement mode, stops a connected run after its measured usage crosses the quota.
-- Expires stale leases after a crashed or disconnected client.
-- Spools numeric updates during transient network failures and replays them idempotently.
-- Gives each user an authenticated own-usage endpoint and gives the administrator aggregate JSON/HTML views.
-- Uses only Node.js 22 built-ins; **no `npm install` is required**.
-
-## Privacy boundary
-
-Codex Meter locally streams Codex session JSONL line by line only to find `token_count` records. It discards every other record and never retains or transmits prompts, responses, tool calls, source content, or other session content.
-
-The only usage values accepted by the server are these five nonnegative safe-integer counters:
-
-- `input_tokens`
-- `cached_input_tokens`
-- `output_tokens`
-- `reasoning_output_tokens`
-- `total_tokens`
-
-Codex Meter does **not** read, copy, proxy, distribute, or store Codex OAuth credentials or `auth.json`. Each person installs and authenticates Codex locally. Separate random meter tokens authorize only this meter, and the server stores their SHA-256 hashes rather than plaintext tokens.
-
-## Requirements
-
-### Server
-
-- Linux, macOS, or Windows with Node.js 22+
-- A trusted HTTPS reverse proxy, VPN, or SSH tunnel if clients connect remotely
-
-### Each client
-
-- Node.js 22+
-- Official Codex CLI installed and authenticated locally
-- A distinct meter token issued by the server administrator
-
-## Quick start: server
-
-Clone the repository on the server:
-
-```sh
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-node --version
-npm test
-```
-
-For rough relative measurement, initialize the state once in **observe-only mode**. This records tokens but never stops Codex at an arbitrary token threshold. Exactly three unique user IDs are mandatory:
-
-```sh
-export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
-umask 077
-node bin/admin.js init \
-  --users=alice,bob,carol \
-  --observe-only \
-  --reset-ms=2592000000 \
-  --max-leases=1 \
-  --lease-ttl-ms=120000 \
-  > meter-tokens-once.json
-```
-
-The example resets only the measurement counters every 30 days. If you intentionally want local enforcement, replace `--observe-only` with `--quota=YOUR_POSITIVE_INTEGER`. That value is an operator-defined local policy, not an OpenAI plan limit.
-
-`meter-tokens-once.json` contains the admin token and three user tokens in plaintext **only once**. Give each person only their own token through a secure channel, then securely remove the file. If you lose the tokens, initialize a new state instead of trying to recover them from the hash-only state file.
-
-Start the server on localhost:
-
-```sh
-CODEX_METER_HOST=127.0.0.1 \
-CODEX_METER_PORT=8787 \
-node bin/server.js
-```
-
-Health check:
-
-```sh
-curl http://127.0.0.1:8787/health
-```
-
-Do not expose this plain HTTP listener directly to an untrusted network. Use HTTPS through a trusted reverse proxy or access it only through a VPN/SSH tunnel. Bearer tokens are credentials and plain HTTP exposes them in transit.
-
-## Client setup
-
-Clone or copy this repository to each user's computer. Never place Codex `auth.json` inside this project.
-
-Each user creates a private `client.json` containing the reachable server URL and only that user's meter token.
-
-### macOS / Linux
-
-```sh
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-mkdir -p "$HOME/.codex-meter"
-chmod 700 "$HOME/.codex-meter"
-cat > "$HOME/.codex-meter/client.json" <<'JSON'
-{
-  "serverUrl": "https://meter.example.internal/",
-  "meterToken": "PASTE_ONLY_THIS_USERS_METER_TOKEN",
-  "pollIntervalMs": 5000
-}
-JSON
-chmod 600 "$HOME/.codex-meter/client.json"
-chmod +x clients/unix/codex-meter
-mkdir -p "$HOME/.local/bin"
-ln -s "$(pwd)/clients/unix/codex-meter" "$HOME/.local/bin/codex-meter"
-```
-
-Use the wrapper anywhere you would normally use `codex`:
-
-```sh
-/path/to/codex-meter/clients/unix/codex-meter
-/path/to/codex-meter/clients/unix/codex-meter --model MODEL_NAME "your prompt"
-codex-meter
-```
-
-Optional shell alias:
-
-```sh
-alias codex-meter="/path/to/codex-meter/clients/unix/codex-meter"
-```
-
-### Windows 10/11 PowerShell
-
-```powershell
-git clone https://github.com/SANGDNOG/codex-meter.git
-cd codex-meter
-New-Item -ItemType Directory -Force "$HOME\.codex-meter" | Out-Null
-@'
-{
-  "serverUrl": "https://meter.example.internal/",
-  "meterToken": "PASTE_ONLY_THIS_USERS_METER_TOKEN",
-  "pollIntervalMs": 5000
-}
-'@ | Set-Content -Encoding utf8 "$HOME\.codex-meter\client.json"
-```
-
-Run Codex through the PowerShell wrapper:
-
-```powershell
-powershell -NoProfile -File .\clients\windows\codex-meter.ps1
-powershell -NoProfile -File .\clients\windows\codex-meter.ps1 --model MODEL_NAME "your prompt"
-```
-
-The wrapper forwards arguments as an array and never invokes `cmd.exe`. It prefers a native `codex.exe`; for the standard npm `codex.cmd` shim, it executes the adjacent official `@openai/codex/bin/codex.js` with Node. For a nonstandard installation, set `CODEX_METER_CODEX` to the full native `codex.exe` path, not a `.cmd` file.
-
-## Configuration
-
-### Server environment variables
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CODEX_METER_STATE` | `~/.codex-meter-server/state.json` | Server state file |
-| `CODEX_METER_HOST` | `127.0.0.1` | Listen address |
-| `CODEX_METER_PORT` | `8787` | Listen port |
-
-### Client settings
-
-| Setting / variable | Default | Purpose |
-|---|---:|---|
-| `serverUrl` | required | Reachable meter server base URL |
-| `meterToken` | required | This user's separate meter credential |
-| `pollIntervalMs` | `5000` | Polling interval, from 1000 to 60000 ms |
-| `CODEX_METER_HOME` | `~/.codex-meter` | Client config, lock, and spool directory |
-| `CODEX_HOME` | `~/.codex` | Local Codex home; sessions are read below `sessions/` |
-| `CODEX_METER_CODEX` | auto-detected | Explicit Codex executable path |
-
-## Usage and administration
-
-A user can open the server root URL and enter their Meter token to see only their own usage. This is a meter-specific credential issued during server initialization, not an OpenAI API key. The page does not store it in a URL, cookie, local storage, or session storage. The authenticated JSON API remains available:
-
-```sh
-curl --oauth2-bearer USER_METER_TOKEN \
-  https://meter.example.internal/v1/usage
-```
-
-The administrator enters the Admin Meter token in the root page to open the aggregate dashboard, or reads the authenticated JSON API:
-
-```sh
-curl --oauth2-bearer ADMIN_METER_TOKEN \
-  https://meter.example.internal/admin.json
-```
-
-To disable or re-enable a user, stop the server first so there are no competing state writers:
-
-```sh
-export CODEX_METER_STATE="$HOME/.codex-meter-server/state.json"
-node bin/admin.js set-enabled alice false
-node bin/admin.js set-enabled alice true
-```
-
-## Exit codes
-
-| Code | Meaning |
-|---:|---|
-| `0` or Codex code | Normal Codex exit |
-| `69` | Meter unavailable at startup |
-| `73` | Another local wrapper holds the client lock |
-| `74` | Local Codex sessions could not be scanned |
-| `75` | Quota/disable stop or permanent HTTP 4xx meter failure |
-| `77` | Start denied because of quota, disable, or active lease |
-| `78` | Missing or invalid local configuration |
-| `127` | Codex executable could not be started |
-
-## Failure behavior
-
-- After a successful start, transient network/server failures **fail open** so local Codex can continue.
-- Numeric absolute updates are written to a private local spool and replayed on the next run.
-- Duplicate replay does not double-count because updates use absolute per-lease high-water values.
-- HTTP 4xx authentication/protocol failures stop the wrapped Codex process.
-- Connected quota enforcement may overshoot by roughly one polling interval.
-- During an outage, central disable/quota enforcement is unavailable and overshoot can be unbounded until connectivity and replay return.
-
-## Limitations
-
-- This is **cooperative metering**. A user can bypass it by launching `codex` directly or altering local software.
-- It is not official OpenAI/Codex quota or billing accounting and may differ from provider totals.
-- One meter user may run only one wrapper at a time; overlapping scans could double-count one user's session directory.
-- Local session deletion/truncation, abrupt power loss, filesystem failure, multiple independent client homes, or future Codex session-format changes can reduce accuracy.
-- `SIGKILL` or sudden power loss can happen before the final local scan. Stale leases prevent permanent lockout but cannot recover events that were never observed.
-
-## Tests
-
-```sh
-npm test
-```
-
-The deterministic `node:test` suite covers local parser filtering, strict request schemas, delta calculation, idempotent updates/replay, authentication failures, exhausted starts, quota crossing, stale leases, hash-only token storage, local locking, literal shell-free arguments, and the real wrapper/server stop path with a fake Codex process.
-
-## Project layout
-
-```text
-bin/                  server, admin CLI, and Codex wrapper entry points
-clients/unix/         macOS/Linux launcher
-clients/windows/      PowerShell launcher
-lib/                  server, store, client, command, and usage modules
-test/                 deterministic Node.js tests and fixtures
-```
-
-## License and disclaimer
-
-MIT License. See [LICENSE](LICENSE).
-
-This is an independent community project and is not affiliated with, endorsed by, or supported by OpenAI. “OpenAI” and “Codex” are trademarks of their respective owners.
+[MIT](LICENSE)
