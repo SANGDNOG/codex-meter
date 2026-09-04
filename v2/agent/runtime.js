@@ -3,7 +3,8 @@ import { lstat, mkdir, readlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { AgentCollector } from './collector.js';
 import { AgentSyncClient } from './sync.js';
-import { AGENT_VERSION, initializeManagedHome } from './config.js';
+import { AGENT_VERSION } from './config.js';
+import { applyDesiredConfiguration, assignmentRows, importLegacyProfiles } from './assignments.js';
 
 function delay(ms) { return new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); }); }
 function setState(database, key, value) {
@@ -55,37 +56,64 @@ export async function bindProfileHome(database, profile) {
 export class AgentRuntime {
   constructor(database, config, options = {}) {
     this.database = database; this.config = config;
+    this.fixedCollectors=options.fixedCollectors===true;
+    this.collectorFactory=options.collectorFactory??((entry)=>new AgentCollector(database,{home:entry.localHome??entry.codexHome,accountId:entry.accountId??null}));
+    this.watchImpl=options.watchImpl??watch;this.applyOptions=options.applyOptions??{};
     this.collectors = options.collectors ?? (options.collector ? [options.collector] :
-      (config.profiles?.length ? config.profiles.map((profile) => new AgentCollector(database, { home: profile.codexHome, accountId: profile.accountId })) : [new AgentCollector(database, { home: config.codexHome })]));
+      (config.profiles?.length ? config.profiles.map((profile) => this.collectorFactory({...profile,localHome:profile.codexHome})) : [this.collectorFactory({localHome:config.codexHome,accountId:null})]));
     this.syncClient = options.syncClient ?? new AgentSyncClient(database, config, options);
-    this.running = false; this.watchers = []; this.reconciling = null; this.syncing = null; this.backoffMs = 1000; this.nextSyncAt = 0;
+    this.running = false; this.watchers = []; this.reconciling = null; this.syncing = null; this.backoffMs = 1000; this.nextSyncAt = 0;this.operation=Promise.resolve();
   }
-  async reconcile() {
+  serialized(action){const result=this.operation.then(action,action);this.operation=result.catch(()=>{});return result;}
+  async reconcileUnlocked() {
     if (!this.reconciling) this.reconciling = Promise.all(this.collectors.map((collector) => collector.reconcile()))
       .then((result) => { setState(this.database, 'last_collect_status', 'healthy'); return result; })
       .catch((error) => { setState(this.database, 'last_collect_status', 'degraded'); throw error; })
       .finally(() => { this.reconciling = null; });
     return this.reconciling;
   }
+  reconcile(){return this.serialized(()=>this.reconcileUnlocked());}
+  activeAssignments(){return assignmentRows(this.database).map((entry)=>({...entry,codexHome:entry.localHome}));}
+  installAssignments(){
+    if(this.fixedCollectors)return;
+    const assignments=this.activeAssignments();
+    const appliedRevision=Number(this.database.prepare("SELECT value FROM agent_state WHERE key='applied_config_revision'").get()?.value??0);
+    const legacyFallback=!Number.isSafeInteger(appliedRevision)||appliedRevision===0;
+    this.collectors=assignments.length?assignments.map((entry)=>this.collectorFactory(entry)):
+      (legacyFallback?[this.collectorFactory({localHome:this.config.codexHome,accountId:null})]:[]);
+    this.syncClient.configureProfiles(assignments);
+  }
+  refreshWatchers(){
+    for(const watcher of this.watchers)watcher.close();this.watchers=[];
+    const homes=this.collectors.map((collector)=>collector.home);
+    for(const directory of homes.flatMap((home)=>[home,path.join(home,'sessions'),path.join(home,'archived_sessions')])){
+      try{this.watchers.push(this.watchImpl(directory,{persistent:directory===homes[0]},()=>this.trigger()));}catch{/* reconciliation is authoritative */}
+    }
+  }
+  async applyConfigurationUnlocked(configuration){
+    if(!configuration||configuration.schemaVersion!==1)return null;
+    const applied=await applyDesiredConfiguration(this.database,this.config,configuration,this.applyOptions);
+    if(applied.applied){this.installAssignments();if(this.running)this.refreshWatchers();}
+    return applied;
+  }
+  applyConfiguration(configuration){return this.serialized(()=>this.applyConfigurationUnlocked(configuration));}
   async sync(heartbeat = false) {
-    if (Date.now() < this.nextSyncAt) return { skipped: true, backoff: true, retryAt: new Date(this.nextSyncAt).toISOString() };
-    const health = { status: this.database.prepare("SELECT value FROM agent_state WHERE key='last_collect_status'").get()?.value === 'degraded' ? 'degraded' : 'healthy' };
-    if (!this.syncing) this.syncing = this.syncClient.sync({ heartbeat, health }).then((result) => { this.backoffMs = 1000; this.nextSyncAt = 0; return result; })
-      .catch((error) => { this.nextSyncAt = Date.now() + this.backoffMs; this.backoffMs = Math.min(this.backoffMs * 2, 5 * 60_000); throw error; })
-      .finally(() => { this.syncing = null; });
-    return this.syncing;
+    return this.serialized(async()=>{
+      if (Date.now() < this.nextSyncAt) return { skipped: true, backoff: true, retryAt: new Date(this.nextSyncAt).toISOString() };
+      const health = { status: this.database.prepare("SELECT value FROM agent_state WHERE key='last_collect_status'").get()?.value === 'degraded' ? 'degraded' : 'healthy' };
+      if (!this.syncing) this.syncing = this.syncClient.sync({ heartbeat, health }).then(async(result) => {this.backoffMs=1000;this.nextSyncAt=0;result.configurationApply=await this.applyConfigurationUnlocked(result.configuration);return result;})
+        .catch((error) => { this.nextSyncAt = Date.now() + this.backoffMs; this.backoffMs = Math.min(this.backoffMs * 2, 5 * 60_000); throw error; })
+        .finally(() => { this.syncing = null; });
+      return this.syncing;
+    });
   }
   trigger() { this.reconcile().then(() => this.sync()).catch(() => {}); }
   async start() {
     if (this.running) return; this.running = true;
     const profiles = this.config.profiles ?? [];
-    if (profiles.length) { await assertProfilesCanonicalDisjoint(profiles); for (const profile of profiles) await bindProfileHome(this.database, profile); await Promise.all(profiles.map((profile) => initializeManagedHome(profile.codexHome, profile.accountId))); }
+    if (profiles.length) { await assertProfilesCanonicalDisjoint(profiles); for (const profile of profiles) await bindProfileHome(this.database, profile); }
     else await mkdir(this.config.codexHome, { recursive: true });
-    await this.reconcile();
-    const homes = profiles.length ? profiles.map((profile) => profile.codexHome) : [this.config.codexHome];
-    for (const directory of homes.flatMap((home) => [home, path.join(home, 'sessions'), path.join(home, 'archived_sessions')])) {
-      try { this.watchers.push(watch(directory, { persistent: directory === homes[0] }, () => this.trigger())); } catch { /* reconciliation is authoritative */ }
-    }
+    await importLegacyProfiles(this.database,this.config);this.installAssignments();await this.reconcile();this.refreshWatchers();
     this.loops = [this.loop(this.config.reconcileIntervalMs, () => this.reconcile()),
       this.loop(this.config.syncIntervalMs, () => this.sync()), this.loop(this.config.heartbeatIntervalMs, () => this.sync(true))];
   }
@@ -97,7 +125,7 @@ export class AgentRuntime {
   }
   async stop() {
     this.running = false; for (const watcher of this.watchers) watcher.close(); this.watchers = [];
-    await Promise.allSettled([this.reconciling, this.syncing].filter(Boolean));
+    await Promise.allSettled([this.operation,this.reconciling, this.syncing].filter(Boolean));
   }
 }
 

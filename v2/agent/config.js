@@ -2,6 +2,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { chmod, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
+import { AGENT_CAPABILITY_HEADER, AGENT_CAPABILITY_HEADER_VALUE, parseServerCapabilities } from '../shared/capabilities.js';
 
 export const AGENT_VERSION = '2.1.0-dev';
 export function defaultStateDirectory() {
@@ -150,12 +151,15 @@ export async function saveConfig(filename, value) {
 }
 export async function enroll({ serverUrl, token, configPath = defaultConfigPath(), allowHttpForTests = false, codexHome: home, codexExecutable, databasePath } = {}) {
   const base = validUrl(serverUrl, allowHttpForTests);
-  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) });
+  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json',[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE }, body: JSON.stringify({ token }) });
   if (!response.ok) throw new Error(`enrollment failed (${response.status})`);
   const result = await response.json();
+  const serverCapabilities=parseServerCapabilities(result.serverCapabilities);
+  if(serverCapabilities===null)throw new Error('enrollment returned invalid Server capabilities');
   const remote = result.agentConfiguration ?? {};
-  return saveConfig(configPath, { serverUrl: result.serverUrl || base, deviceId: result.deviceId, deviceSecret: result.deviceSecret,
+  const config=await saveConfig(configPath, { serverUrl: result.serverUrl || base, deviceId: result.deviceId, deviceSecret: result.deviceSecret,
     codexHome: home, codexExecutable, databasePath, allowHttpForTests, syncIntervalMs: remote.syncIntervalSeconds ? remote.syncIntervalSeconds * 1000 : undefined,
     heartbeatIntervalMs: remote.heartbeatIntervalSeconds ? remote.heartbeatIntervalSeconds * 1000 : undefined,
     maxBatchSize: Math.min(remote.maxBatchSize ?? 100, 100) });
+  return{config,desiredConfiguration:serverCapabilities&&remote.schemaVersion===1?remote:null};
 }

@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MeterService, ServiceError } from './service.js';
+import { AGENT_CAPABILITY_HEADER, parseAgentCapabilityHeader } from '../shared/capabilities.js';
 
 const MAX_BODY = 1024 * 1024;
 const COOKIE = 'codex_meter_session';
@@ -49,6 +50,11 @@ function bearer(request) {
   const match = request.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]{1,128})\.([A-Za-z0-9_-]{20,200})$/);
   return match ? { deviceId: match[1], secret: match[2] } : null;
 }
+function agentCapabilities(request) {
+  const parsed=parseAgentCapabilityHeader(request.headers[AGENT_CAPABILITY_HEADER]);
+  if(parsed===null)throw new ServiceError(400,'invalid_capabilities');
+  return parsed;
+}
 function adminSession(service, request) {
   const session = service.session(cookies(request.headers.cookie)[COOKIE]);
   if (!session) throw new ServiceError(401, 'authentication_required');
@@ -78,13 +84,13 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
       }
       if (method === 'POST' && path === '/api/v1/agent/enroll') {
         if (!secureTransport(request, trustedProxies)) throw new ServiceError(426, 'https_required');
-        return json(response, 201, service.enroll(await body(request)));
+        return json(response, 201, service.enroll(await body(request),agentCapabilities(request)));
       }
       if (method === 'POST' && path === '/api/v1/agent/sync') {
         if (!secureTransport(request, trustedProxies)) throw new ServiceError(426, 'https_required');
         const credentials = bearer(request); const device = credentials && service.authenticateDevice(credentials.deviceId, credentials.secret);
         if (!device) throw new ServiceError(401, 'invalid_device_credential');
-        return json(response, 200, service.sync(device, await body(request)));
+        return json(response, 200, service.sync(device, await body(request),agentCapabilities(request)));
       }
       const session = adminSession(service, request);
       if (method === 'GET' && path === '/api/v1/auth/session') return json(response, 200, { authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt });
@@ -117,6 +123,8 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
       if (match && method === 'POST') return json(response, 201, service.bindAccount(decodeURIComponent(match[1]), await body(request)));
       match = path.match(/^\/api\/v1\/devices\/([^/]+)\/account-bindings\/([^/]+)$/);
       if (match && method === 'DELETE') return json(response, 200, service.disableBinding(decodeURIComponent(match[1]), decodeURIComponent(match[2])));
+      match = path.match(/^\/api\/v1\/devices\/([^/]+)\/configuration\/rollback$/);
+      if (match && method === 'POST') return json(response, 200, service.rollbackConfiguration(decodeURIComponent(match[1]), await body(request)));
       match = path.match(/^\/api\/v1\/devices\/([^/]+)\/(move|disable|rotate)$/);
       if (match && method === 'POST') {
         const deviceId = decodeURIComponent(match[1]);

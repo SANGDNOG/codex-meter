@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { parseSignedInt64, parseUnsignedInt64 } from '../shared/int64.js';
+import { SERVER_CAPABILITIES } from '../shared/capabilities.js';
 import { hashPassword, hashSecret, salt, secret, verifyPassword, verifySecret } from './security.js';
 
 const DIMENSIONS = ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'];
@@ -10,6 +11,9 @@ const SAFE_METADATA = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const QUOTA_STATUSES = new Set(['available', 'ambiguous', 'unavailable']);
 const QUOTA_ERROR_KINDS = new Set(['codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits']);
 const PLAN_TYPES = new Set(['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu']);
+const BINDING_MODES = new Set(['default','isolated','legacy']);
+const CONFIG_STATUSES = new Set(['unknown','applying','healthy','apply_failed','migration_attention_required']);
+const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped']);
 
 export class ServiceError extends Error {
   constructor(status, code, message = code) { super(message); this.status = status; this.code = code; }
@@ -82,6 +86,24 @@ function parseQuotaReport(value) {
   if(value.status==='unavailable'&&errorKind==='ambiguous_limits')fail(400,'invalid_quota');
   return{observedAt,status:value.status,errorKind,planType,windows};
 }
+function parseCapabilities(value) {
+  if(value===undefined)return{agentConfigurationSchema:null,declarativeProfiles:false,actualState:false};
+  exact(value,['agentConfigurationSchema','declarativeProfiles','actualState']);
+  if(value.agentConfigurationSchema!==1||value.declarativeProfiles!==true||typeof value.actualState!=='boolean')fail(400,'invalid_capabilities');
+  return value;
+}
+function parseConfigurationState(value) {
+  if(value===undefined)return null;
+  exact(value,['desiredRevision','appliedRevision','status','errorKind','profiles']);
+  if(!Number.isSafeInteger(value.desiredRevision)||value.desiredRevision<0||!Number.isSafeInteger(value.appliedRevision)||value.appliedRevision<0||value.appliedRevision>value.desiredRevision||!CONFIG_STATUSES.has(value.status))fail(400,'invalid_configuration_state');
+  const errorKind=value.errorKind===null?null:metadata(value.errorKind,'errorKind');
+  if(value.status==='healthy'&&value.appliedRevision!==value.desiredRevision)fail(400,'invalid_configuration_state');
+  if(value.status==='apply_failed'&&(!errorKind||value.appliedRevision===value.desiredRevision))fail(400,'invalid_configuration_state');
+  if(!Array.isArray(value.profiles)||value.profiles.length>64)fail(400,'invalid_configuration_state');
+  const profiles=value.profiles.map((profile)=>{exact(profile,['bindingId','accountId','mode','state'],['launcher']);if(!['default','isolated','preserve'].includes(profile.mode)||!PROFILE_STATES.has(profile.state))fail(400,'invalid_configuration_state');return{bindingId:id(profile.bindingId,'bindingId'),accountId:id(profile.accountId,'accountId'),mode:profile.mode,state:profile.state,launcher:profile.launcher===undefined?null:metadata(profile.launcher,'launcher')};});
+  if(new Set(profiles.map((profile)=>profile.bindingId)).size!==profiles.length)fail(400,'invalid_configuration_state');
+  return{desiredRevision:value.desiredRevision,appliedRevision:value.appliedRevision,status:value.status,errorKind,profiles};
+}
 function id(value, field = 'id') {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) fail(400, 'invalid_field', `invalid ${field}`);
   return value;
@@ -130,11 +152,16 @@ function addMeasured(target, row) {
 function wireDimensions(values) { return Object.fromEntries(DIMENSIONS.map((key) => [key, values[key].toString()])); }
 function groupWire(row) { return { id: row.id, name: row.name, archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
 function accountWire(row) { return { id: row.id, name: row.name, reference: Boolean(row.reference), archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
-function bindingWire(row) { return { id: row.id, deviceId: row.device_id, accountId: row.account_id, codexHomeKey: row.codex_home_key, createdAt: row.created_at, disabledAt: row.disabled_at }; }
+function bindingWire(row) { return { id: row.id, deviceId: row.device_id, accountId: row.account_id, mode: row.mode === 'legacy' ? 'preserve' : row.mode, createdAt: row.created_at, disabledAt: row.disabled_at }; }
 function membershipAt(database, deviceId, occurredAt) {
   return database.prepare(`SELECT group_id FROM device_group_memberships
     WHERE device_id = ? AND valid_from <= ? AND (valid_until IS NULL OR valid_until > ?)
     ORDER BY valid_from DESC LIMIT 1`).get(deviceId, occurredAt, occurredAt)?.group_id ?? null;
+}
+function bindingAt(database, deviceId, accountId, occurredAt) {
+  return database.prepare(`SELECT b.id FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id
+    WHERE b.device_id=? AND b.account_id=? AND (b.mode='legacy' OR b.created_at<=?) AND (b.disabled_at IS NULL OR b.disabled_at>?)
+      AND (a.archived_at IS NULL OR a.archived_at>?) ORDER BY b.created_at DESC LIMIT 1`).get(deviceId,accountId,occurredAt,occurredAt,occurredAt);
 }
 function closeOpenMembership(database, deviceId, at) {
   const open = database.prepare('SELECT id, valid_from FROM device_group_memberships WHERE device_id=? AND valid_until IS NULL').get(deviceId);
@@ -227,15 +254,54 @@ export class MeterService {
     id(accountId,'accountId');exact(body,[],['name','reference','archived']);if(!Object.keys(body).length)fail(400,'invalid_body');const row=this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);if(!row)fail(404,'account_not_found');
     if('reference'in body&&typeof body.reference!=='boolean')fail(400,'invalid_field');if('archived'in body&&typeof body.archived!=='boolean')fail(400,'invalid_field');
     const name='name'in body?text(body.name,'name'):row.name,reference='reference'in body?(body.reference?1:0):row.reference,archived='archived'in body?(body.archived?nowIso(this.clock):null):row.archived_at,now=nowIso(this.clock);
-    try{this.database.prepare('UPDATE accounts SET name=?,reference=?,archived_at=?,updated_at=? WHERE id=?').run(name,reference,archived,now,accountId);}catch(error){if(String(error).includes('UNIQUE'))fail(409,reference?'reference_exists':'account_name_exists');throw error;}return accountWire(this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId));
+    try{tx(this.database,()=>{this.database.prepare('UPDATE accounts SET name=?,reference=?,archived_at=?,updated_at=? WHERE id=?').run(name,reference,archived,now,accountId);if(name!==row.name||archived!==row.archived_at)this.publishAccountDeviceConfigurations(accountId);});}
+    catch(error){if(String(error).includes('UNIQUE'))fail(409,reference?'reference_exists':'account_name_exists');throw error;}return accountWire(this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId));
+  }
+  publishDeviceConfiguration(deviceId,{sourceRevision=null}={}){
+    const now=nowIso(this.clock),device=this.database.prepare('SELECT desired_config_revision FROM devices WHERE id=?').get(deviceId);if(!device)fail(404,'device_not_found');
+    const revision=device.desired_config_revision+1;
+    this.database.prepare('UPDATE devices SET desired_config_revision=?,updated_at=? WHERE id=?').run(revision,now,deviceId);
+    this.database.prepare(`INSERT INTO device_configuration_revisions(device_id,revision,schema_version,sync_interval_seconds,heartbeat_interval_seconds,max_batch_size,created_at)
+      VALUES(?,?,1,15,60,100,?)`).run(deviceId,revision,now);
+    if(sourceRevision===null){
+      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode)
+        SELECT b.device_id,?,b.id,b.account_id,a.name,b.mode FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id
+        WHERE b.device_id=? AND b.disabled_at IS NULL AND a.archived_at IS NULL ORDER BY b.created_at,b.id`).run(revision,deviceId);
+    }else{
+      if(!Number.isSafeInteger(sourceRevision)||sourceRevision<1)fail(400,'invalid_configuration_revision');
+      const source=this.database.prepare('SELECT 1 FROM device_configuration_revisions WHERE device_id=? AND revision=?').get(deviceId,sourceRevision);if(!source)fail(404,'configuration_revision_not_found');
+      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode)
+        SELECT device_id,?,binding_id,account_id,name,mode FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).run(revision,deviceId,sourceRevision);
+    }
+    return revision;
+  }
+  publishAccountDeviceConfigurations(accountId){
+    const deviceIds=this.database.prepare('SELECT DISTINCT device_id FROM device_account_bindings WHERE account_id=? AND disabled_at IS NULL ORDER BY device_id').all(accountId);
+    for(const {device_id:deviceId} of deviceIds)this.publishDeviceConfiguration(deviceId);
+  }
+  rollbackConfiguration(deviceId,body){
+    id(deviceId,'deviceId');exact(body,['revision']);return tx(this.database,()=>({revision:this.publishDeviceConfiguration(deviceId,{sourceRevision:body.revision})}));
   }
   bindAccount(deviceId,body){
-    id(deviceId,'deviceId');this.deviceDetail(deviceId);exact(body,['accountId','codexHomeKey']);const accountId=id(body.accountId,'accountId'),key=metadata(body.codexHomeKey,'codexHomeKey');if(!key)fail(400,'invalid_field');
-    if(!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');const now=nowIso(this.clock),binding={id:randomUUID(),deviceId,accountId,codexHomeKey:key,createdAt:now,disabledAt:null};
-    try{this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,created_at) VALUES(?,?,?,?,?)').run(binding.id,deviceId,accountId,key,now);}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_home_reused');throw error;}return binding;
+    id(deviceId,'deviceId');this.deviceDetail(deviceId);exact(body,['accountId'],['mode','codexHomeKey']);const accountId=id(body.accountId,'accountId');
+    const mode=body.mode===undefined?'legacy':body.mode;if(!BINDING_MODES.has(mode)||mode==='legacy'&&body.codexHomeKey===undefined&&body.mode!==undefined)fail(400,'invalid_mode');
+    if(body.codexHomeKey!==undefined&&!metadata(body.codexHomeKey,'codexHomeKey'))fail(400,'invalid_field');
+    if(!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');const now=nowIso(this.clock),binding={id:randomUUID(),deviceId,accountId,mode:mode==='legacy'?'preserve':mode,createdAt:now,disabledAt:null};
+    try{tx(this.database,()=>{this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(binding.id,deviceId,accountId,body.codexHomeKey??randomUUID(),mode,now);this.publishDeviceConfiguration(deviceId);});}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_mode_conflict');throw error;}return binding;
   }
-  disableBinding(deviceId,bindingId){id(deviceId,'deviceId');id(bindingId,'bindingId');const now=nowIso(this.clock),result=this.database.prepare('UPDATE device_account_bindings SET disabled_at=coalesce(disabled_at,?) WHERE id=? AND device_id=?').run(now,bindingId,deviceId);if(!result.changes)fail(404,'binding_not_found');return bindingWire(this.database.prepare('SELECT * FROM device_account_bindings WHERE id=?').get(bindingId));}
+  disableBinding(deviceId,bindingId){
+    id(deviceId,'deviceId');id(bindingId,'bindingId');const row=this.database.prepare('SELECT * FROM device_account_bindings WHERE id=? AND device_id=?').get(bindingId,deviceId);if(!row)fail(404,'binding_not_found');
+    if(row.disabled_at)return bindingWire(row);const now=nowIso(this.clock);tx(this.database,()=>{this.database.prepare('UPDATE device_account_bindings SET disabled_at=? WHERE id=?').run(now,bindingId);this.publishDeviceConfiguration(deviceId);});return bindingWire(this.database.prepare('SELECT * FROM device_account_bindings WHERE id=?').get(bindingId));
+  }
   activeBinding(deviceId,accountId){return this.database.prepare(`SELECT b.id FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id WHERE b.device_id=? AND b.account_id=? AND b.disabled_at IS NULL AND a.archived_at IS NULL`).get(deviceId,accountId);}
+  desiredConfiguration(deviceId){
+    const device=this.database.prepare('SELECT desired_config_revision FROM devices WHERE id=?').get(deviceId);if(!device)fail(404,'device_not_found');
+    if(device.desired_config_revision===0)return{schemaVersion:1,revision:0,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[]};
+    const revision=this.database.prepare('SELECT * FROM device_configuration_revisions WHERE device_id=? AND revision=?').get(deviceId,device.desired_config_revision);if(!revision)fail(500,'configuration_revision_missing');
+    const profiles=this.database.prepare(`SELECT binding_id,account_id,name,mode FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).all(deviceId,revision.revision)
+      .map((row)=>({bindingId:row.binding_id,accountId:row.account_id,name:row.name,mode:row.mode==='legacy'?'preserve':row.mode}));
+    return{schemaVersion:revision.schema_version,revision:revision.revision,syncIntervalSeconds:revision.sync_interval_seconds,heartbeatIntervalSeconds:revision.heartbeat_interval_seconds,maxBatchSize:revision.max_batch_size,profiles};
+  }
   createGroup(body) {
     exact(body, ['name']); const now = nowIso(this.clock); const group = { id: randomUUID(), name: text(body.name, 'name'), archivedAt: null, createdAt: now, updatedAt: now };
     try { this.database.prepare('INSERT INTO groups (id,name,created_at,updated_at) VALUES (?,?,?,?)').run(group.id, group.name, now, now); }
@@ -254,18 +320,21 @@ export class MeterService {
   }
 
   createDevice(body) {
-    exact(body, ['name'], ['groupId', 'expiresInSeconds']); const name = text(body.name, 'name'); const groupId = body.groupId == null ? null : id(body.groupId, 'groupId');
+    exact(body, ['name'], ['groupId', 'expiresInSeconds','accountId','mode']); const name = text(body.name, 'name'); const groupId = body.groupId == null ? null : id(body.groupId, 'groupId');
     if (groupId && !this.database.prepare('SELECT id FROM groups WHERE id=? AND archived_at IS NULL').get(groupId)) fail(400, 'invalid_group');
+    const accountId=body.accountId==null?null:id(body.accountId,'accountId');if(accountId&&!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');
+    const mode=accountId?(body.mode??'default'):null;if(mode!==null&&!['default','isolated'].includes(mode))fail(400,'invalid_mode');if(!accountId&&body.mode!==undefined)fail(400,'invalid_mode');
     let ttl = this.enrollmentTtlMs;
     if ('expiresInSeconds' in body) { if (!Number.isInteger(body.expiresInSeconds) || body.expiresInSeconds < 1 || body.expiresInSeconds > 3600) fail(400, 'invalid_field'); ttl = body.expiresInSeconds * 1000; }
     const raw = secret(); const tokenSalt = salt(); const enrollmentId = randomUUID(); const createdAt = nowIso(this.clock); const expiresAt = new Date(this.clock() + ttl).toISOString();
-    this.database.prepare('INSERT INTO device_enrollments (id,device_name,group_id,token_hash,expires_at,created_at,token_salt) VALUES (?,?,?,?,?,?,?)')
-      .run(enrollmentId, name, groupId, hashSecret(raw, tokenSalt), expiresAt, createdAt, tokenSalt);
-    return { enrollmentId, enrollmentToken: raw, expiresAt, deviceName: name, groupId };
+    this.database.prepare('INSERT INTO device_enrollments (id,device_name,group_id,token_hash,expires_at,created_at,token_salt,account_id,binding_mode) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(enrollmentId, name, groupId, hashSecret(raw, tokenSalt), expiresAt, createdAt, tokenSalt,accountId,mode);
+    return { enrollmentId, enrollmentToken: raw, expiresAt, deviceName: name, groupId, accountId, mode };
   }
 
-  enroll(body) {
+  enroll(body, capabilitiesValue) {
     exact(body, ['token']); const raw = text(body.token, 'token', 200); const now = nowIso(this.clock);
+    const declarative=parseCapabilities(capabilitiesValue).declarativeProfiles;
     return tx(this.database, () => {
       let enrollment = null;
       for (const row of this.database.prepare('SELECT * FROM device_enrollments WHERE consumed_at IS NULL').all()) {
@@ -276,12 +345,14 @@ export class MeterService {
       const consumed = this.database.prepare('UPDATE device_enrollments SET consumed_at=? WHERE id=? AND consumed_at IS NULL').run(now, enrollment.id);
       if (consumed.changes !== 1) fail(409, 'enrollment_used');
       const deviceId = randomUUID(); const deviceSecret = secret(); const credentialSalt = salt();
-      this.database.prepare(`INSERT INTO devices (id,name,credential_hash,credential_salt,current_group_id,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?)`).run(deviceId, enrollment.device_name, hashSecret(deviceSecret, credentialSalt), credentialSalt, enrollment.group_id, now, now);
+      this.database.prepare(`INSERT INTO devices (id,name,credential_hash,credential_salt,current_group_id,desired_config_revision,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?)`).run(deviceId, enrollment.device_name, hashSecret(deviceSecret, credentialSalt), credentialSalt, enrollment.group_id,0, now, now);
       if (enrollment.group_id) this.database.prepare('INSERT INTO device_group_memberships (id,device_id,group_id,valid_from) VALUES (?,?,?,?)')
         .run(randomUUID(), deviceId, enrollment.group_id, now);
+      if(enrollment.account_id){this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(randomUUID(),deviceId,enrollment.account_id,randomUUID(),enrollment.binding_mode,now);this.publishDeviceConfiguration(deviceId);}
       this.database.prepare('UPDATE device_enrollments SET device_id=? WHERE id=?').run(deviceId, enrollment.id);
-      return { deviceId, deviceSecret, serverUrl: this.serverUrl, agentConfiguration: this.configuration() };
+      return { deviceId, deviceSecret, serverUrl: this.serverUrl, agentConfiguration: declarative?this.desiredConfiguration(deviceId):this.configuration(),
+        ...(declarative?{serverCapabilities:SERVER_CAPABILITIES}:{}) };
     });
   }
 
@@ -304,7 +375,7 @@ export class MeterService {
     const age=(this.clock()-Date.parse(row.last_seen_at))/1000,{onlineSeconds,staleSeconds}=this.deviceThresholds();
     return age<onlineSeconds?'online':age<=staleSeconds?'stale':'offline';
   }
-  deviceWire(row) { return { id: row.id, name: row.name, currentGroupId: row.current_group_id, currentGroupName: row.group_name ?? null, disabledAt: row.disabled_at, removedAt: row.removed_at, lastSeenAt: row.last_seen_at, state:this.deviceState(row), agentVersion: row.agent_version, codexVersion: row.codex_version, health: row.health_status ?? 'unknown', createdAt: row.created_at, updatedAt: row.updated_at }; }
+  deviceWire(row) { const desired=row.desired_config_revision??0,applied=row.applied_config_revision??0,reported=row.configuration_status??'unknown';return { id: row.id, name: row.name, currentGroupId: row.current_group_id, currentGroupName: row.group_name ?? null, disabledAt: row.disabled_at, removedAt: row.removed_at, lastSeenAt: row.last_seen_at, state:this.deviceState(row), agentVersion: row.agent_version, codexVersion: row.codex_version, health: row.health_status ?? 'unknown', desiredRevision:desired, appliedRevision:applied, configurationStatus:row.declarative_profiles_supported?(applied<desired&&reported==='healthy'?'applying':reported):'unsupported', configurationErrorKind:row.configuration_error_kind??null, configurationReportedAt:row.configuration_reported_at??null, createdAt: row.created_at, updatedAt: row.updated_at }; }
   enrollmentStatus(enrollmentId) {
     id(enrollmentId,'enrollmentId'); const row=this.database.prepare('SELECT id,expires_at,device_id FROM device_enrollments WHERE id=?').get(enrollmentId);
     if(!row)fail(404,'enrollment_not_found');
@@ -316,7 +387,8 @@ export class MeterService {
     const memberships = this.database.prepare(`SELECT m.group_id groupId,g.name groupName,m.valid_from validFrom,m.valid_until validUntil
       FROM device_group_memberships m JOIN groups g ON g.id=m.group_id WHERE m.device_id=? ORDER BY m.valid_from`).all(deviceId).map((r)=>({...r}));
     const profiles=this.database.prepare(`SELECT b.*,a.name,a.reference,a.archived_at account_archived_at FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id WHERE b.device_id=? ORDER BY a.name`).all(deviceId).map((binding)=>({
-      ...bindingWire(binding),name:binding.name,reference:Boolean(binding.reference),accountArchivedAt:binding.account_archived_at,measured:this.usage('all',{deviceId,accountId:binding.account_id}).measured
+      ...bindingWire(binding),name:binding.name,reference:Boolean(binding.reference),accountArchivedAt:binding.account_archived_at,measured:this.usage('all',{deviceId,accountId:binding.account_id}).measured,
+      actual:this.database.prepare('SELECT state,launcher_name launcher,reported_at reportedAt FROM device_profile_status WHERE device_id=? AND binding_id=?').get(deviceId,binding.id)??null
     }));
     return { ...this.deviceWire(row), memberships, profiles };
   }
@@ -338,8 +410,21 @@ export class MeterService {
   rotateDevice(deviceId) { id(deviceId); this.deviceDetail(deviceId); const raw=secret(); const credentialSalt=salt(); const now=nowIso(this.clock); this.database.prepare('UPDATE devices SET credential_hash=?,credential_salt=?,updated_at=? WHERE id=?').run(hashSecret(raw,credentialSalt),credentialSalt,now,deviceId); return {deviceId,deviceSecret:raw}; }
   removeDevice(deviceId) { id(deviceId); this.deviceDetail(deviceId); const now=nowIso(this.clock); tx(this.database,()=>{ closeOpenMembership(this.database, deviceId, now); const discardedSecret=secret(); const discardedSalt=salt(); this.database.prepare(`UPDATE devices SET removed_at=?,disabled_at=coalesce(disabled_at,?),current_group_id=NULL,credential_hash=?,credential_salt=?,updated_at=? WHERE id=?`).run(now,now,hashSecret(discardedSecret,discardedSalt),discardedSalt,now,deviceId); }); }
 
-  sync(device, body) {
-    exact(body, ['agentVersion','codexVersion','events','health'],['quotaReport','quotaReports']);
+  sync(device, body, capabilitiesValue) {
+    exact(body, ['agentVersion','codexVersion','events','health'],['quotaReport','quotaReports','configurationState']);
+    const capabilities=parseCapabilities(capabilitiesValue),configurationState=parseConfigurationState(body.configurationState);
+    if(configurationState&&!capabilities.actualState)fail(400,'configuration_capability_required');
+    if(configurationState&&configurationState.desiredRevision>device.desired_config_revision)fail(400,'invalid_configuration_revision');
+    if(configurationState){
+      const expected=configurationState.appliedRevision===0?[]:this.database.prepare(`SELECT binding_id,account_id,mode FROM device_configuration_revision_profiles
+        WHERE device_id=? AND revision=? ORDER BY binding_id`).all(device.id,configurationState.appliedRevision);
+      if(configurationState.appliedRevision>0&&!this.database.prepare('SELECT 1 FROM device_configuration_revisions WHERE device_id=? AND revision=?').get(device.id,configurationState.appliedRevision))fail(400,'stale_configuration_revision');
+      const byBinding=new Map(expected.map((row)=>[row.binding_id,row]));
+      const reportedIds=new Set(configurationState.profiles.map((profile)=>profile.bindingId));
+      if(expected.some((row)=>!reportedIds.has(row.binding_id)))fail(400,'missing_configuration_profile');
+      if(configurationState.profiles.some((profile)=>!byBinding.has(profile.bindingId)))fail(400,'extra_configuration_profile');
+      for(const profile of configurationState.profiles){const binding=byBinding.get(profile.bindingId),mode=binding.mode==='legacy'?'preserve':binding.mode;if(binding.account_id!==profile.accountId)fail(400,'wrong_configuration_account');if(mode!==profile.mode)fail(400,'wrong_configuration_mode');}
+    }
     const reporter=this.database.prepare("SELECT value FROM server_settings WHERE key='quota_reporter_device_id'").get()?.value??null;
     if('quotaReport'in body&&reporter!==device.id) fail(403,'not_quota_reporter');
     const quota='quotaReport'in body?parseQuotaReport(body.quotaReport):null;
@@ -356,7 +441,7 @@ export class MeterService {
       const accountId=event.accountId===undefined?null:id(event.accountId,'accountId');
       const parsed={eventId:id(event.eventId,'eventId'),accountId,occurredAt:timestamp(event.occurredAt,'occurredAt'),model:metadata(event.model,'model'),reasoningEffort:metadata(event.reasoningEffort,'reasoningEffort')};
       for(const key of DIMENSIONS){ if(event[key]===null && key!=='totalTokens') parsed[key]=null; else { try{parsed[key]=parseUnsignedInt64(event[key]);}catch{fail(400,'invalid_tokens');} } }
-      if(accountId&&!this.activeBinding(device.id,accountId)){rejected.push({eventId:parsed.eventId,reason:'account_not_bound'});return null;}
+      if(accountId&&!bindingAt(this.database,device.id,accountId,parsed.occurredAt)){rejected.push({eventId:parsed.eventId,reason:'account_not_bound'});return null;}
       return parsed;
     });
     const eventIds=body.events.map((event)=>event.eventId);if(new Set(eventIds).size!==eventIds.length)fail(400,'duplicate_event_id_in_batch');
@@ -371,11 +456,19 @@ export class MeterService {
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(),device.id,event.eventId,event.occurredAt,receivedAt,groupId,event.inputTokens,event.cachedInputTokens,event.cacheWriteInputTokens,event.outputTokens,event.reasoningOutputTokens,event.totalTokens,event.model,event.reasoningEffort,event.accountId);
         accepted.push(event.eventId);
       }
-      this.database.prepare('UPDATE devices SET last_seen_at=?,agent_version=?,codex_version=?,health_status=?,updated_at=? WHERE id=?').run(receivedAt,agentVersion,codexVersion,body.health.status,receivedAt,device.id);
+      this.database.prepare(`UPDATE devices SET last_seen_at=?,agent_version=?,codex_version=?,health_status=?,agent_configuration_schema=?,declarative_profiles_supported=?,actual_state_supported=?,updated_at=? WHERE id=?`)
+        .run(receivedAt,agentVersion,codexVersion,body.health.status,capabilities.agentConfigurationSchema,capabilities.declarativeProfiles?1:0,capabilities.actualState?1:0,receivedAt,device.id);
+      if(configurationState){
+        this.database.prepare('UPDATE devices SET applied_config_revision=?,configuration_status=?,configuration_error_kind=?,configuration_reported_at=? WHERE id=?').run(configurationState.appliedRevision,configurationState.status,configurationState.errorKind,receivedAt,device.id);
+        this.database.prepare('DELETE FROM device_profile_status WHERE device_id=?').run(device.id);
+        const insertStatus=this.database.prepare('INSERT INTO device_profile_status(device_id,binding_id,account_id,mode,state,launcher_name,reported_at) VALUES(?,?,?,?,?,?,?)');
+        for(const profile of configurationState.profiles)insertStatus.run(device.id,profile.bindingId,profile.accountId,profile.mode,profile.state,profile.launcher,receivedAt);
+      }
       if(quota)this.replaceQuota(device.id,quota);
       for(const report of profileQuotas)this.replaceAccountQuota(device.id,report.accountId,report.quota);
     });
-    return {acceptedEventIds:accepted,duplicateEventIds:duplicate,rejectedEvents:rejected,serverTime:receivedAt,agentConfiguration:this.configuration(),isQuotaReporter:reporter===device.id};
+    return {acceptedEventIds:accepted,duplicateEventIds:duplicate,rejectedEvents:rejected,serverTime:receivedAt,agentConfiguration:capabilities.declarativeProfiles?this.desiredConfiguration(device.id):this.configuration(),
+      ...(capabilities.declarativeProfiles?{serverCapabilities:SERVER_CAPABILITIES}:{}),isQuotaReporter:reporter===device.id};
   }
 
   replaceQuota(deviceId,quota){

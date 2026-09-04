@@ -320,6 +320,24 @@ test('QCA 28 partial denominator starts at coverage baseline', () => fixture(asy
   assert.equal(windowFor(ctx.service.quotaAttribution(account.id)).tracked.totalTokens, '5');
 }));
 
+test('QCA 28a partial boundaries, account isolation, future filtering, disabled history, and revisions preserve the denominator', () => fixture(async (ctx) => {
+  const account = ctx.account('Target'), other = ctx.account('Other'), device = ctx.device(account), otherDevice = ctx.device(other);
+  ctx.partial(device, account, 60, '2026-09-01T17:30:00.000Z');
+  ctx.event(device, account, '2026-09-01T17:29:59.999Z', 100);
+  ctx.event(device, account, '2026-09-01T17:30:00.000Z', 2);
+  ctx.event(device, account, '2026-09-01T17:30:00.001Z', 3);
+  ctx.event(otherDevice, other, '2026-09-01T17:45:00.000Z', 200);
+  ctx.event(device, account, '2026-09-01T18:00:00.001Z', 400);
+  assert.equal(windowFor(ctx.service.quotaAttribution(account.id)).tracked.totalTokens, '5');
+  ctx.service.updateAccount(account.id, { name: 'Target renamed' });
+  assert.equal(windowFor(ctx.service.quotaAttribution(account.id)).tracked.totalTokens, '5');
+  const binding = ctx.database.prepare('SELECT id FROM device_account_bindings WHERE device_id=? AND account_id=?').get(device.id, account.id);
+  ctx.database.prepare('UPDATE device_account_bindings SET disabled_at=? WHERE id=?').run('2026-09-01T17:50:00.000Z', binding.id);
+  assert.equal(ctx.event(device, account, '2026-09-01T17:49:59.999Z', 7).acceptedEventIds.length, 1);
+  assert.deepEqual(ctx.event(device, account, '2026-09-01T17:50:00.000Z', 11).rejectedEvents.map(item=>item.reason), ['account_not_bound']);
+  assert.equal(windowFor(ctx.service.quotaAttribution(account.id)).tracked.totalTokens, '12');
+}));
+
 test('QCA 29 negative same-cycle quota delta is ambiguous and unavailable', () => fixture(async (ctx) => {
   const account = ctx.account(), device = ctx.device(account); ctx.partial(device, account, 60); ctx.report(device, account, '2026-09-01T18:00:00.000Z', [FIVE_H(58)]);
   const estimate = windowFor(ctx.service.quotaAttribution(account.id)).estimate; assert.equal(estimate.status, 'ambiguous'); assert.equal(estimate.reason, 'provider_used_percent_regressed');

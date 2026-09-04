@@ -8,14 +8,18 @@ import path from 'node:path';
 import { openAgentDatabase } from '../v2/agent/database.js';
 import { openServerDatabase } from '../v2/server/database.js';
 import { AgentCollector } from '../v2/agent/collector.js';
-import { initializeManagedHome, profileLauncher, saveConfig, validateConfig } from '../v2/agent/config.js';
+import { AgentSyncClient } from '../v2/agent/sync.js';
+import { enroll, initializeManagedHome, profileLauncher, saveConfig, validateConfig } from '../v2/agent/config.js';
 import { runAgentCli } from '../v2/agent/cli.js';
+import { applyDesiredConfiguration } from '../v2/agent/assignments.js';
 import { MeterService, ServiceError } from '../v2/server/service.js';
 import { createV2Server } from '../v2/server/http.js';
+import { parseAgentCapabilityHeader, parseServerCapabilities } from '../v2/shared/capabilities.js';
 
 const exec = promisify(execFile);
 
 const NOW = Date.parse('2026-09-01T12:00:00.000Z');
+const CAPABILITY_HEADER = 'agentConfigurationSchema=1;declarativeProfiles=1;actualState=1';
 const META = (id) => `${JSON.stringify({type:'session_meta',payload:{id,model:'gpt-5'}})}\n`;
 const USAGE = (tokens, minute=0) => `${JSON.stringify({timestamp:`2026-09-01T12:${String(minute).padStart(2,'0')}:00Z`,type:'event_msg',payload:{type:'token_count',info:{last_token_usage:{total_tokens:tokens,input_tokens:tokens,output_tokens:0,cached_input_tokens:0,reasoning_output_tokens:0}}}})}\n`;
 function event(eventId,totalTokens,accountId){return{eventId,accountId,occurredAt:'2026-09-01T12:00:00.000Z',inputTokens:String(totalTokens),cachedInputTokens:'0',cacheWriteInputTokens:null,outputTokens:'0',reasoningOutputTokens:'0',totalTokens:String(totalTokens),model:'gpt-5',reasoningEffort:null};}
@@ -47,6 +51,20 @@ test('V2.1 account bindings authorize attribution, aggregate across devices, and
   assert.deepEqual(service.sync(d1,body([event('disabled',1,b.id)])).rejectedEvents,[{eventId:'disabled',reason:'account_not_bound'}]);
   service.updateAccount(a.id,{archived:true});assert.deepEqual(service.sync(d2,body([event('archived',1,a.id)])).rejectedEvents,[{eventId:'archived',reason:'account_not_bound'}]);
   assert.equal(database.prepare("SELECT COUNT(*) count FROM usage_events WHERE event_id IN ('inject','disabled','archived')").get().count,0);
+}));
+
+test('V2.1 temporal bindings preserve legacy history and enforce declarative half-open intervals',()=>fixture(async({service,addDevice,advance})=>{
+  const legacy=service.createAccount({name:'Legacy'}),declarative=service.createAccount({name:'Declarative'}),unrelated=service.createAccount({name:'Unrelated'}),legacyDevice=addDevice('legacy-device'),device=addDevice('declarative-device');
+  service.bindAccount(legacyDevice.id,{accountId:legacy.id,codexHomeKey:'legacy-home'});const binding=service.bindAccount(device.id,{accountId:declarative.id,mode:'default'});
+  const send=(target,account,eventId,occurredAt)=>service.sync(target,body([{...event(eventId,1,account.id),occurredAt}]),target===device?{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true}:undefined);
+  assert.equal(send(legacyDevice,legacy,'legacy-old','2026-09-01T11:59:59.999Z').acceptedEventIds.length,1);
+  assert.deepEqual(send(device,declarative,'before-created','2026-09-01T11:59:59.999Z').rejectedEvents,[{eventId:'before-created',reason:'account_not_bound'}]);
+  assert.equal(send(device,declarative,'at-created','2026-09-01T12:00:00.000Z').acceptedEventIds.length,1);
+  advance(1_000);service.disableBinding(device.id,binding.id);
+  assert.equal(send(device,declarative,'delayed-before-disable','2026-09-01T12:00:00.999Z').acceptedEventIds.length,1);
+  assert.deepEqual(send(device,declarative,'at-disable','2026-09-01T12:00:01.000Z').rejectedEvents,[{eventId:'at-disable',reason:'account_not_bound'}]);
+  assert.deepEqual(send(device,declarative,'after-disable','2026-09-01T12:00:01.001Z').rejectedEvents,[{eventId:'after-disable',reason:'account_not_bound'}]);
+  assert.deepEqual(send(device,unrelated,'unrelated','2026-09-01T12:00:00.500Z').rejectedEvents,[{eventId:'unrelated',reason:'account_not_bound'}]);
 }));
 
 test('V2.1 profile quota is isolated by account and stale independently',()=>fixture(async({service,addDevice,advance})=>{
@@ -179,4 +197,99 @@ test('V2.1 PowerShell launcher restores CODEX_HOME presence and value in finally
 
 test('V2.1 payload/schema sources never identify provider accounts or access auth.json',async()=>{
   for(const file of ['v2/agent/app-server.js','v2/agent/collector.js','v2/agent/sync.js','v2/server/service.js']){const source=await readFile(new URL(`../${file}`,import.meta.url),'utf8');assert.doesNotMatch(source,/readFile\([^)]*auth\.json|accessToken|providerAccountId|providerEmail/i);}
+});
+
+test('V2.1 new Agent uses a header capability while preserving the legacy request shape until Server confirmation',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-protocol-')),database=openAgentDatabase(path.join(root,'agent.db')),requests=[];
+  const config={serverUrl:'https://old-meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'.codex'),maxBatchSize:100};
+  const response={acceptedEventIds:[],duplicateEventIds:[],rejectedEvents:[],serverTime:'2026-09-01T12:00:00.000Z',agentConfiguration:{syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100},isQuotaReporter:false};
+  const client=new AgentSyncClient(database,config,{clock:()=>NOW,fetchImpl:async(_url,options)=>{requests.push({headers:options.headers,body:JSON.parse(options.body)});return new Response(JSON.stringify(response),{status:200,headers:{'content-type':'application/json'}});}});
+  try{
+    const now=new Date(NOW).toISOString();database.prepare(`INSERT INTO profile_assignments(binding_id,account_id,name,mode,origin,local_home,active,desired_revision,applied_revision,state,created_at,updated_at)
+      VALUES('legacy-a','account-a','A','preserve','imported',?,1,0,0,'tracking',?,?)`).run(path.join(root,'legacy'),now,now);
+    await client.sync({heartbeat:true});await client.sync({heartbeat:true});
+    assert.equal(requests.length,2);assert.equal(requests[0].headers['x-codex-meter-capabilities'],CAPABILITY_HEADER);
+    for(const request of requests)assert.deepEqual(Object.keys(request.body).sort(),['agentVersion','codexVersion','events','health'].sort());
+    assert.equal(database.prepare('SELECT COUNT(*) count FROM profile_assignments WHERE active=1').get().count,1);
+  }finally{database.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('V2.1 old to new negotiation sends actual state only after explicit New Server capability confirmation',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-negotiation-')),database=openAgentDatabase(path.join(root,'agent.db')),requests=[];
+  const desired={schemaVersion:1,revision:0,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[]};
+  const base={acceptedEventIds:[],duplicateEventIds:[],rejectedEvents:[],serverTime:'2026-09-01T12:00:00.000Z',isQuotaReporter:false};
+  const responses=[{...base,agentConfiguration:{syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100}},
+    {...base,agentConfiguration:desired,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true}},
+    {...base,agentConfiguration:desired,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true}}];
+  const client=new AgentSyncClient(database,{serverUrl:'https://new-meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'.codex'),maxBatchSize:100},
+    {clock:()=>NOW,fetchImpl:async(_url,options)=>{requests.push(JSON.parse(options.body));return new Response(JSON.stringify(responses.shift()),{status:200,headers:{'content-type':'application/json'}});}});
+  try{
+    assert.equal((await client.sync({heartbeat:true})).configuration,null);assert.equal((await client.sync({heartbeat:true})).configuration.revision,0);await client.sync({heartbeat:true});
+    assert.equal('configurationState' in requests[0],false);assert.equal('configurationState' in requests[1],false);assert.deepEqual(requests[2].configurationState,{desiredRevision:0,appliedRevision:0,status:'unknown',errorKind:null,profiles:[]});
+  }finally{database.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('V2.1 Server capability gate keeps old Agents on legacy configuration and returns explicit metadata to new Agents',()=>fixture(async({service,addDevice})=>{
+  const account=service.createAccount({name:'Personal'}),device=addDevice('protocol-device');service.bindAccount(device.id,{accountId:account.id,mode:'default'});
+  const legacy=service.sync(device,body());assert.deepEqual(Object.keys(legacy.agentConfiguration).sort(),['heartbeatIntervalSeconds','maxBatchSize','syncIntervalSeconds'].sort());assert.equal('serverCapabilities' in legacy,false);
+  const capable=service.sync(device,body(),{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true});
+  assert.equal(capable.agentConfiguration.schemaVersion,1);assert.equal(capable.agentConfiguration.profiles.length,1);
+  assert.deepEqual(capable.serverCapabilities,{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true});
+}));
+
+test('V2.1 capability grammar is strict and carries no remote execution data',()=>{
+  assert.deepEqual(parseAgentCapabilityHeader(CAPABILITY_HEADER),{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true});
+  for(const value of ['',`${CAPABILITY_HEADER};path=1`,`${CAPABILITY_HEADER};actualState=1`,'agentConfigurationSchema=1;declarativeProfiles=/tmp/x;actualState=1',
+    'agentConfigurationSchema=1;declarativeProfiles=1;actualState=$(id)','agentConfigurationSchema=1;declarativeProfiles=1;environment=1',
+    'agentConfigurationSchema=2;declarativeProfiles=1;actualState=1','agentConfigurationSchema=1;declarativeProfiles=1;actualState=0'])assert.equal(parseAgentCapabilityHeader(value),null);
+  assert.equal(parseAgentCapabilityHeader(undefined),undefined);
+  assert.deepEqual(parseServerCapabilities({agentConfigurationSchema:1,declarativeProfiles:true,actualState:true}),{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true});
+  assert.equal(parseServerCapabilities({agentConfigurationSchema:1,declarativeProfiles:true,actualState:true,path:'/tmp/private'}),null);
+  assert.equal(parseServerCapabilities(undefined),undefined);
+});
+
+test('V2.1 enrollment activates declarative configuration only with valid Server capabilities',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-enrollment-capability-')),originalFetch=globalThis.fetch;
+  const desired={schemaVersion:1,revision:1,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[{bindingId:'binding-a',accountId:'account-a',name:'A',mode:'default'}]};
+  const base={deviceId:'device',deviceSecret:'x'.repeat(32),serverUrl:'https://meter.example',agentConfiguration:desired};let response={...base};
+  globalThis.fetch=async()=>new Response(JSON.stringify(response),{status:201,headers:{'content-type':'application/json'}});
+  try{
+    const options={serverUrl:'https://meter.example',token:'enrollment-token',codexHome:path.join(root,'.codex'),databasePath:path.join(root,'agent.db')};
+    const legacy=await enroll({...options,configPath:path.join(root,'legacy.json')});assert.equal(legacy.desiredConfiguration,null);
+    response={...base,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true,path:'/bad'}};
+    const malformedPath=path.join(root,'malformed.json');await assert.rejects(enroll({...options,configPath:malformedPath}),/invalid Server capabilities/);await assert.rejects(stat(malformedPath),error=>error.code==='ENOENT');
+    response={...base,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true}};
+    const negotiated=await enroll({...options,configPath:path.join(root,'negotiated.json')});assert.equal(negotiated.desiredConfiguration.revision,1);
+  }finally{globalThis.fetch=originalFetch;await rm(root,{recursive:true,force:true});}
+});
+
+test('V2.1 malformed or unconfirmed Server capabilities cannot activate declarative configuration',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-unconfirmed-')),database=openAgentDatabase(path.join(root,'agent.db'));
+  const desired={schemaVersion:1,revision:99,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[{bindingId:'b',accountId:'a',name:'A',mode:'isolated'}]};
+  const responses=[{agentConfiguration:desired},{agentConfiguration:desired,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true,path:'/tmp/injected'}}];
+  const client=new AgentSyncClient(database,{serverUrl:'https://old.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'.codex'),maxBatchSize:100},
+    {clock:()=>NOW,fetchImpl:async()=>new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],rejectedEvents:[],serverTime:new Date(NOW).toISOString(),isQuotaReporter:false,...responses.shift()}),{status:200,headers:{'content-type':'application/json'}})});
+  try{assert.equal((await client.sync({heartbeat:true})).configuration,null);await assert.rejects(client.sync({heartbeat:true}),/invalid Server capabilities/);assert.equal(database.prepare("SELECT value FROM agent_state WHERE key='remote_declarative_supported'").get()?.value,'false');}
+  finally{database.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('V2.1 confirmed New Server downgrade preserves local state, stops actual-state reporting, and recovers after malformed capability',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-v21-downgrade-')),database=openAgentDatabase(path.join(root,'agent.db')),requests=[];
+  const declaration={schemaVersion:1,revision:1,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[{bindingId:'binding-a',accountId:'account-a',name:'A',mode:'default'}]};
+  const base={acceptedEventIds:[],duplicateEventIds:[],rejectedEvents:[],serverTime:new Date(NOW).toISOString(),isQuotaReporter:false};
+  const responses=[
+    {...base,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true},agentConfiguration:declaration},
+    {...base,agentConfiguration:{syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100}},
+    {...base,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true,path:'/bad'},agentConfiguration:{...declaration,revision:2,profiles:[]}},
+    {...base,serverCapabilities:{agentConfigurationSchema:1,declarativeProfiles:true,actualState:true},agentConfiguration:{...declaration,revision:2}}
+  ];
+  const client=new AgentSyncClient(database,{serverUrl:'https://meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'.codex'),maxBatchSize:100},
+    {clock:()=>NOW,fetchImpl:async(_url,options)=>{requests.push(JSON.parse(options.body));return new Response(JSON.stringify(responses.shift()),{status:200,headers:{'content-type':'application/json'}});}});
+  try{
+    let result=await client.sync({heartbeat:true});assert.equal(result.configuration.revision,1);await applyDesiredConfiguration(database,{codexHome:path.join(root,'.codex'),databasePath:path.join(root,'agent.db'),codexExecutable:'codex'},result.configuration,{clock:()=>NOW,baseline:async()=>{}});
+    database.prepare("INSERT INTO usage_outbox(event_id,account_id,occurred_at,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,created_at) VALUES('pending','account-a','t',1,0,NULL,0,0,1,'t')").run();
+    result=await client.sync({heartbeat:true});assert.equal(result.configuration,null);assert.equal(requests[1].configurationState.appliedRevision,1);assert.equal(database.prepare("SELECT value FROM agent_state WHERE key='remote_actual_state_supported'").get().value,'false');
+    await assert.rejects(client.sync({heartbeat:true}),/invalid Server capabilities/);assert.equal(database.prepare('SELECT COUNT(*) count FROM profile_assignments WHERE active=1').get().count,1);assert.equal(database.prepare('SELECT COUNT(*) count FROM usage_outbox').get().count,1);
+    result=await client.sync({heartbeat:true});assert.equal('configurationState' in requests[3],false);assert.equal(result.configuration.revision,2);assert.equal(database.prepare('SELECT COUNT(*) count FROM profile_assignments WHERE active=1').get().count,1);
+  }finally{database.close();await rm(root,{recursive:true,force:true});}
 });

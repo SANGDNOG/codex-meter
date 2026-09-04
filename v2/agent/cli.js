@@ -3,6 +3,7 @@ import path from 'node:path';
 import { AGENT_VERSION, defaultConfigPath, enroll, initializeManagedHome, loadConfig, profileLauncher, saveConfig, validateConfig } from './config.js';
 import { openAgentDatabase } from './database.js';
 import { AgentRuntime, agentStatus, assertProfilesCanonicalDisjoint, bindProfileHome, canonicalHome } from './runtime.js';
+import { applyDesiredConfiguration, importLegacyProfiles } from './assignments.js';
 import { AgentCollector } from './collector.js';
 import { lifecyclePaths, serviceStatus, uninstallInstalledAgent, updateInstalledAgent } from './lifecycle.js';
 
@@ -14,8 +15,9 @@ export async function runAgentCli(args = process.argv.slice(2), { stdout = proce
   if (command === 'enroll') {
     const serverUrl = option(args, '--server'); const token = option(args, '--token');
     if (!serverUrl || !token) throw new Error('enroll requires --server and --token');
-    await enroll({ serverUrl, token, configPath, allowHttpForTests: args.includes('--allow-http-for-tests'), codexHome: option(args, '--codex-home') || undefined,
+    const enrollment=await enroll({ serverUrl, token, configPath, allowHttpForTests: args.includes('--allow-http-for-tests'), codexHome: option(args, '--codex-home') || undefined,
       codexExecutable: option(args, '--codex-executable') || undefined });
+    if(enrollment.desiredConfiguration){const database=openAgentDatabase(enrollment.config.databasePath);try{await importLegacyProfiles(database,enrollment.config);const applied=await applyDesiredConfiguration(database,enrollment.config,enrollment.desiredConfiguration);if(!applied.applied&&!applied.idempotent)throw applied.error??new Error('initial desired configuration failed');}finally{database.close();}}
     stdout.write('enrolled\n'); return 0;
   }
   const config = await loadConfig(configPath);

@@ -1,5 +1,7 @@
 import { AGENT_VERSION } from './config.js';
 import { QuotaReporter } from './app-server.js';
+import { configurationState } from './assignments.js';
+import { AGENT_CAPABILITY_HEADER, AGENT_CAPABILITY_HEADER_VALUE, parseServerCapabilities } from '../shared/capabilities.js';
 
 const COLUMNS = ['input_tokens','cached_input_tokens','cache_write_input_tokens','output_tokens','reasoning_output_tokens','total_tokens'];
 const WIRE = ['inputTokens','cachedInputTokens','cacheWriteInputTokens','outputTokens','reasoningOutputTokens','totalTokens'];
@@ -25,15 +27,18 @@ function profileQuotaState(database, report, clock) {
   database.prepare(`INSERT INTO profile_quota_status(account_id,status,error_kind,attempted_at) VALUES(?,?,?,?)
     ON CONFLICT(account_id) DO UPDATE SET status=excluded.status,error_kind=excluded.error_kind,attempted_at=excluded.attempted_at`)
     .run(report.accountId, report.status, report.errorKind ?? null, attemptedAt);
+  const stateValue=report.errorKind==='not_authenticated'?'login_required':report.status==='available'?'quota_available':'quota_unavailable';
+  database.prepare('UPDATE profile_assignments SET state=?,updated_at=? WHERE account_id=? AND active=1').run(stateValue,attemptedAt,report.accountId);
 }
 
 export class AgentSyncClient {
-  constructor(database, config, { fetchImpl = fetch, clock = Date.now, codexVersion = null, timeoutMs = 30_000, quotaReporter } = {}) {
+  constructor(database, config, { fetchImpl = fetch, clock = Date.now, codexVersion = null, timeoutMs = 30_000, quotaReporter, quotaReporterFactory } = {}) {
     this.database = database; this.config = config; this.fetch = fetchImpl; this.clock = clock; this.codexVersion = codexVersion; this.timeoutMs = timeoutMs;
+    this.quotaReporterFactory=quotaReporterFactory??((profile)=>new QuotaReporter({clock:this.clock,accountId:profile.accountId,codexHome:profile.localHome??profile.codexHome,command:profile.codexExecutable??this.config.codexExecutable??'codex'}));
     this.quotaReporter = (config.profiles ?? []).length ? null : (quotaReporter ?? new QuotaReporter({ clock, command: config.codexExecutable ?? 'codex', codexHome: config.codexHome }));
-    this.profileQuotaReporters = (config.profiles ?? []).map((profile) => new QuotaReporter({ clock, accountId: profile.accountId,
-      codexHome: profile.codexHome, command: profile.codexExecutable ?? config.codexExecutable ?? 'codex' }));
+    this.configureProfiles((config.profiles??[]).map((profile)=>({...profile,localHome:profile.codexHome})));
   }
+  configureProfiles(profiles){this.profileQuotaReporters=profiles.map((profile)=>this.quotaReporterFactory(profile));if(profiles.length)this.quotaReporter=null;}
   pending() { return this.database.prepare('SELECT COUNT(*) count FROM usage_outbox').get().count; }
   async sync({ heartbeat = false, health = { status: 'healthy' } } = {}) {
     const rows = outboxRows(this.database, this.config.maxBatchSize);
@@ -49,19 +54,27 @@ export class AgentSyncClient {
       state(this.database, 'last_quota_error_kind', failed?.errorKind ?? '', this.clock);
       for (const report of quotaReports ?? []) profileQuotaState(this.database, report, this.clock);
     }
-    const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const remoteActualState=this.database.prepare("SELECT value FROM agent_state WHERE key='remote_actual_state_supported'").get()?.value==='true';
+    const reportedConfiguration=remoteActualState?configurationState(this.database):undefined;
+    const requestBody={agentVersion:AGENT_VERSION,codexVersion:this.codexVersion,events:rows.map(wire),health,
+      ...(quotaReport===undefined?{}:{quotaReport}),...(quotaReports===undefined?{}:{quotaReports}),...(reportedConfiguration===undefined?{}:{configurationState:reportedConfiguration})};
+    const send=async(payload)=>{
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),this.timeoutMs);
+      try{return await this.fetch(`${this.config.serverUrl}/api/v1/agent/sync`,{method:'POST',signal:controller.signal,
+        headers:{'content-type':'application/json',authorization:`Bearer ${this.config.deviceId}.${this.config.deviceSecret}`,[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE},body:JSON.stringify(payload)});}
+      finally{clearTimeout(timer);}
+    };
     let response;
     try {
-      response = await this.fetch(`${this.config.serverUrl}/api/v1/agent/sync`, {
-        method: 'POST', signal: controller.signal,
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.config.deviceId}.${this.config.deviceSecret}` },
-        body: JSON.stringify({ agentVersion: AGENT_VERSION, codexVersion: this.codexVersion, events: rows.map(wire), health,
-          ...(quotaReport === undefined ? {} : { quotaReport }), ...(quotaReports === undefined ? {} : { quotaReports }) })
-      });
+      response=await send(requestBody);
+      if(response.status===403&&quotaReports!==undefined){
+        let errorBody=null;try{errorBody=await response.json();}catch{/* retry only a stable structured rejection */}
+        if(errorBody?.error==='account_not_bound'){const retryBody={...requestBody};delete retryBody.quotaReports;response=await send(retryBody);}
+      }
     } catch (error) {
       state(this.database, 'last_sync_status', 'unavailable', this.clock);
       throw new Error('agent sync unavailable', { cause: error });
-    } finally { clearTimeout(timer); }
+    }
     if (!response.ok) {
       state(this.database, 'last_sync_status', `http_${response.status}`, this.clock);
       if (response.status === 403 && designated) state(this.database, 'is_quota_reporter', false, this.clock);
@@ -78,6 +91,9 @@ export class AgentSyncClient {
       if (rejection.reason === 'account_not_bound' && sent.has(rejection.eventId) && !acknowledged.has(rejection.eventId))
         permanentlyRejected.set(rejection.eventId, rejection.reason);
     }
+    const serverCapabilities=parseServerCapabilities(result.serverCapabilities);
+    const serverCapabilitiesPresent=result.serverCapabilities!==undefined;
+    if(serverCapabilities===null){state(this.database,'last_sync_status','protocol_error',this.clock);throw new Error('agent sync returned invalid Server capabilities');}
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const remove = this.database.prepare('DELETE FROM usage_outbox WHERE event_id=?');
@@ -90,10 +106,14 @@ export class AgentSyncClient {
       state(this.database, 'last_sync_status', 'ok', this.clock);
       state(this.database, 'last_sync_at', new Date(this.clock()).toISOString(), this.clock);
       if (result.serverTime) state(this.database, 'last_server_time', result.serverTime, this.clock);
+      if(serverCapabilities)
+        state(this.database,'remote_declarative_supported','true',this.clock);
+      if(serverCapabilities?.actualState===true)state(this.database,'remote_actual_state_supported','true',this.clock);
+      if(!serverCapabilitiesPresent){state(this.database,'remote_declarative_supported','false',this.clock);state(this.database,'remote_actual_state_supported','false',this.clock);}
       state(this.database, 'is_quota_reporter', result.isQuotaReporter === true, this.clock);
       this.database.exec('COMMIT');
     } catch (error) { this.database.exec('ROLLBACK'); throw error; }
-    return { sent: rows.length, acknowledged: acknowledged.size, rejected: permanentlyRejected.size, pending: this.pending(), configuration: result.agentConfiguration ?? null,
+    return { sent: rows.length, acknowledged: acknowledged.size, rejected: permanentlyRejected.size, pending: this.pending(), configuration: serverCapabilities?result.agentConfiguration??null:null,
       isQuotaReporter: result.isQuotaReporter === true };
   }
 }
