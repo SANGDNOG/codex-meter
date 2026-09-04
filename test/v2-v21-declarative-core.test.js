@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -191,6 +192,38 @@ test('Core applied empty declarative config cannot resurrect the legacy quota re
   let importedGlobalObservations=0,importedProfileObservations=0;const importedBodies=[];
   const importedClient=new AgentSyncClient(database,importedConfig,{clock:()=>NOW,quotaReporter:{async observe(){importedGlobalObservations+=1;throw new Error('global legacy reporter must stay disabled');}},quotaReporterFactory:(entry)=>({accountId:entry.accountId,async observe(){importedProfileObservations+=1;return{accountId:entry.accountId,observedAt:new Date(NOW).toISOString(),status:'unavailable',errorKind:'not_authenticated',planType:null,windows:[]};}}),fetchImpl:async(_url,options)=>{importedBodies.push(JSON.parse(options.body));return new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],isQuotaReporter:true}),{status:200,headers:{'content-type':'application/json'}});}});
   const importedRuntime=new AgentRuntime(database,importedConfig,{syncClient:importedClient,collectorFactory:(entry)=>({home:entry.localHome,accountId:entry.accountId,async reconcile(){}})});importedRuntime.installAssignments();await importedClient.sync({heartbeat:true});assert.equal(importedGlobalObservations,0);assert.equal(importedProfileObservations,1);assert.equal('quotaReport'in importedBodies[0],false);assert.deepEqual(importedBodies[0].quotaReports.map(report=>report.accountId),['personal']);
+}));
+
+test('Core Agent CLI stays alive with an empty declarative revision and shuts down cleanly',()=>tempDatabase(async({root,database})=>{
+  const configPath=path.join(root,'agent.json'),databasePath=path.join(root,'agent.db'),config={serverUrl:'https://meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'untracked-default'),databasePath,codexExecutable:process.execPath,maxBatchSize:100};
+  await applyDesiredConfiguration(database,config,desired(1,[]),{clock:()=>NOW});await writeFile(configPath,JSON.stringify(config),{mode:0o600});
+  const child=spawn(process.execPath,[new URL('../bin/v2-agent.js',import.meta.url).pathname,'run','--config',configPath],{stdio:'ignore'});let exitResult=null;
+  const exited=new Promise(resolve=>child.once('exit',(code,signal)=>{exitResult={code,signal};resolve(exitResult);}));
+  try {
+    await new Promise(resolve=>setTimeout(resolve,300));assert.equal(exitResult,null,'empty declarative Agent exited before a shutdown signal');
+    child.kill('SIGTERM');assert.deepEqual(await exited,{code:0,signal:null});
+    assert.equal(database.prepare("SELECT value FROM agent_state WHERE key='runtime_status'").get().value,'stopped');
+  } finally { if(exitResult===null){child.kill('SIGKILL');await exited;} }
+}));
+
+test('Core Agent CLI handles a shutdown request while runtime startup is still in progress',()=>tempDatabase(async({root,database})=>{
+  const home=path.join(root,'.codex'),sessions=path.join(home,'sessions');await mkdir(sessions,{recursive:true});
+  for(let offset=0;offset<1024;offset+=128)await Promise.all(Array.from({length:128},(_,index)=>writeFile(path.join(sessions,`rollout-${String(offset+index).padStart(4,'0')}.jsonl`),'\n')));
+  const configPath=path.join(root,'agent.json'),databasePath=path.join(root,'agent.db'),config={serverUrl:'https://meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:home,databasePath,codexExecutable:process.execPath,maxBatchSize:100};
+  await writeFile(configPath,JSON.stringify(config),{mode:0o600});
+  const child=spawn(process.execPath,[new URL('../bin/v2-agent.js',import.meta.url).pathname,'run','--config',configPath],{stdio:'ignore'});let exitResult=null;
+  const exited=new Promise(resolve=>child.once('exit',(code,signal)=>{exitResult={code,signal};resolve(exitResult);}));
+  try {
+    let starting=false;const deadline=Date.now()+5000;
+    while(Date.now()<deadline&&exitResult===null){
+      const running=database.prepare("SELECT value FROM agent_state WHERE key='runtime_status'").get()?.value==='running';
+      const reconciled=database.prepare("SELECT value FROM agent_state WHERE key='last_collect_status'").get();
+      if(running&&!reconciled){starting=true;break;}await new Promise(resolve=>setTimeout(resolve,1));
+    }
+    assert.equal(starting,true,'did not observe the child during runtime startup');child.kill('SIGTERM');
+    assert.deepEqual(await exited,{code:0,signal:null});
+    assert.equal(database.prepare("SELECT value FROM agent_state WHERE key='runtime_status'").get().value,'stopped');
+  } finally { if(exitResult===null){child.kill('SIGKILL');await exited;} }
 }));
 
 test('Core default-home real rollout baselines old usage, uploads only new usage, and rebinds without reassignment',()=>tempDatabase(async({root,database})=>{

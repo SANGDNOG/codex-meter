@@ -63,17 +63,27 @@ export async function runAgentCli(args = process.argv.slice(2), { stdout = proce
   if (command === 'run') {
     if (process.platform !== 'win32') await chmod(configPath, 0o600);
     const database = openAgentDatabase(config.databasePath); const runtime = new AgentRuntime(database, config);
+    let stopRequested = false; let resolveStop;
+    const stopped = new Promise((resolve) => { resolveStop = resolve; });
+    const requestStop = () => { stopRequested = true; resolveStop(); };
+    process.on('SIGINT', requestStop); process.on('SIGTERM', requestStop);
+    // An empty declarative configuration has no persistent filesystem watchers.
+    const keepAlive = setInterval(() => {}, 60_000);
     try {
       const at = new Date().toISOString(); database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES('runtime_status','running',?)
         ON CONFLICT(key) DO UPDATE SET value='running',updated_at=excluded.updated_at`).run(at);
       await runtime.start();
-      await new Promise((resolve) => { process.once('SIGINT', resolve); process.once('SIGTERM', resolve); });
+      if (!stopRequested) await stopped;
       return 0;
     } finally {
-      await runtime.stop();
-      database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES('runtime_status','stopped',?)
-        ON CONFLICT(key) DO UPDATE SET value='stopped',updated_at=excluded.updated_at`).run(new Date().toISOString());
-      database.close();
+      clearInterval(keepAlive);
+      try {
+        await runtime.stop();
+        database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES('runtime_status','stopped',?)
+          ON CONFLICT(key) DO UPDATE SET value='stopped',updated_at=excluded.updated_at`).run(new Date().toISOString());
+      } finally {
+        process.off('SIGINT', requestStop); process.off('SIGTERM', requestStop); database.close();
+      }
     }
   }
   stderr.write(`${usage()}\n`); return 2;
