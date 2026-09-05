@@ -171,7 +171,7 @@ Account 화면은 measured usage, 현재 quota, 등록된 Device의 reporting co
 ```sh
 mkdir -p releases
 cd releases
-release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.0'
+release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.1'
 for asset in \
   manifest.json \
   SHA256SUMS \

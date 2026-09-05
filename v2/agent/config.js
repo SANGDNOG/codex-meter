@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from
 import { parse as parseToml } from 'smol-toml';
 import { AGENT_CAPABILITY_HEADER, AGENT_CAPABILITY_HEADER_VALUE, parseServerCapabilities } from '../shared/capabilities.js';
 
-export const AGENT_VERSION = '2.1.0';
+export const AGENT_VERSION = '2.1.1';
 export function defaultStateDirectory() {
   if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'CodexMeter');
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Codex Meter');

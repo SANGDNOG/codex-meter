@@ -67,7 +67,7 @@ test('M7 release manifest and checksums are deterministic and workflow enforces 
     let result=await exec(process.execPath,['scripts/release-v2-manifest.js',dir],{cwd:path.resolve('.'),stdio:['ignore','pipe','pipe']}); assert.equal(result.code,0,result.err);
     const first=await readFile(path.join(dir,'manifest.json'),'utf8'), sums=await readFile(path.join(dir,'SHA256SUMS'),'utf8');
     result=await exec(process.execPath,['scripts/release-v2-manifest.js',dir],{cwd:path.resolve('.'),stdio:['ignore','pipe','pipe']}); assert.equal(result.code,0,result.err); assert.equal(await readFile(path.join(dir,'manifest.json'),'utf8'),first);
-    const manifest=JSON.parse(first); assert.equal(manifest.version,'2.1.0'); assert.deepEqual(Object.keys(manifest.artifacts),['linux-x64','macos-arm64','windows-x64']); assert.equal(sums.trim().split('\n').length,3);
+    const manifest=JSON.parse(first); assert.equal(manifest.version,'2.1.1'); assert.deepEqual(Object.keys(manifest.artifacts),['linux-x64','macos-arm64','windows-x64']); assert.equal(sums.trim().split('\n').length,3);
     const workflow=await readFile('.github/workflows/release-v2.yml','utf8'); const packaging=await readFile('scripts/package-v2-agent.js','utf8');
     for(const required of ['ubuntu-24.04','windows-2025','macos-14','24.15.0','--version',' status --config','SHA256SUMS','RUNNER_OS','cygpath -m']) assert.ok(workflow.includes(required),`workflow missing ${required}`);
     assert.ok(workflow.includes('(cd dist/release-v2 && sha256sum --check SHA256SUMS)'),'workflow must verify checksums from the artifact directory');

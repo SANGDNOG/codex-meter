@@ -171,7 +171,7 @@ Do not mix a manifest and binaries from different releases. The following stagin
 ```sh
 mkdir -p releases
 cd releases
-release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.0'
+release_url='https://github.com/SANGDNOG/codex-meter/releases/download/v2-agent-2.1.1'
 for asset in \
   manifest.json \
   SHA256SUMS \
