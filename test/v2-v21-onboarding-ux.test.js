@@ -147,6 +147,74 @@ test('V2.1 DOM flow signs in, creates a current-login Device, and renders safe e
   });
 });
 
+test('V2.1 DOM Device onboarding creates and selects its first Account Profile inline',async()=>{
+  let accounts=[],createdBody=null;const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[{id:'group-1',name:'Development',archivedAt:null}]});
+    if(route==='/api/v1/accounts?range=all')return jsonResponse(200,{accounts});
+    if(route==='/api/v1/accounts'&&method==='POST'){createdBody=JSON.parse(options.body);const created={id:'personal',name:createdBody.name,reference:false,archivedAt:null};accounts=[created];return jsonResponse(201,created);}
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/devices/add',fetchImpl},async({document,settle})=>{
+    document.querySelector('[data-testid="device-name"]').value='Laptop';document.querySelector('[data-testid="initial-environment-separate"]').click();document.querySelector('[data-testid="new-profile-from-onboarding"]').click();document.querySelector('[data-testid="profile-name"]').value='Personal';document.querySelector('[data-testid="save-profile"]').click();await settle();
+    assert.deepEqual(createdBody,{name:'Personal',reference:false});assert.equal(document.querySelector('[data-testid="device-name"]').value,'Laptop');assert.equal(document.querySelector('[data-testid="initial-account"]').value,'personal');assert.equal(document.querySelector('[data-testid="initial-environment-separate"]').checked,true);assert.equal(document.querySelector('[data-testid="add-device-form"] [type="submit"]').disabled,false);
+  });
+});
+
+test('V2.1 DOM Accounts flow creates a new Account Profile from the New profile button',async()=>{
+  const accounts=[];let createdBody=null;const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route.startsWith('/api/v1/accounts?range='))return jsonResponse(200,{accounts:accounts.map(account=>({...account,devices:0,measured:{...ZERO},quota:unavailableQuota(),trackingCoverage:{registeredDevices:0,reportingDevices:0,status:'unknown'}}))});
+    if(route==='/api/v1/accounts'&&method==='POST'){createdBody=JSON.parse(options.body);const account={id:'research',name:createdBody.name,reference:createdBody.reference,archivedAt:null};accounts.push(account);return jsonResponse(201,account);}
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/accounts',fetchImpl},async({document,settle})=>{
+    const create=document.querySelector('[data-testid="new-profile"]');assert.ok(create);assert.equal(create.disabled,false);create.click();
+    const dialog=document.querySelector('[data-testid="account-profile-dialog"]');assert.ok(dialog);document.querySelector('[data-testid="profile-name"]').value='Research <script>';
+    document.querySelector('[data-testid="save-profile"]').click();await settle();assert.deepEqual(createdBody,{name:'Research <script>',reference:false});assert.equal(document.querySelector('[data-testid="account-profile-dialog"]'),null);assert.match(document.querySelector('main').textContent,/Research <script>/);assert.equal(document.querySelector('main script'),null);
+  });
+});
+
+test('V2.1 DOM Device flow creates and selects a Profile when no unbound Profile exists',async()=>{
+  const personal={id:'personal',name:'Personal',archivedAt:null,trackingCoverage:{registeredDevices:1,reportingDevices:1,status:'full'},measured:{...ZERO},quota:unavailableQuota()};let accounts=[personal],createdBody=null,addedBody=null;
+  const profile={id:'personal-binding',accountId:'personal',name:'Personal',mode:'isolated',disabledAt:null,reference:false,measured:{...ZERO},trackingState:'tracking',lastActivityAt:null,actual:{state:'tracking',launcher:'cx1',reportedAt:'2026-09-04T12:00:00.000Z'}};
+  const device={id:'device-1',name:'Laptop',currentGroupId:null,currentGroupName:null,disabledAt:null,lastSeenAt:'2026-09-04T12:00:00.000Z',state:'online',configurationStatus:'healthy',desiredRevision:1,appliedRevision:1,profiles:[profile]};
+  const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route==='/api/v1/devices/device-1')return jsonResponse(200,device);
+    if(route==='/api/v1/usage/devices/device-1?range=today')return jsonResponse(200,emptyUsage());
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts?range=all')return jsonResponse(200,{accounts});
+    if(route==='/api/v1/accounts'&&method==='POST'){createdBody=JSON.parse(options.body);const created={id:'research',name:createdBody.name,reference:false,archivedAt:null};accounts=[...accounts,created];return jsonResponse(201,created);}
+    if(route==='/api/v1/devices/device-1/account-bindings'&&method==='POST'){addedBody=JSON.parse(options.body);return jsonResponse(201,{id:'research-binding'});}
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/devices/device-1',fetchImpl},async({document,settle})=>{
+    const add=document.querySelector('[data-testid="add-account"]');assert.equal(add.disabled,false);add.click();assert.equal(document.querySelector('[data-testid="confirm-add-account"]').disabled,true);
+    document.querySelector('[data-testid="account-environment-separate"]').click();document.querySelector('[data-testid="new-profile-from-device"]').click();assert.ok(document.querySelector('[data-testid="account-profile-dialog"]'));document.querySelector('[data-testid="profile-name"]').value='Research';document.querySelector('[data-testid="save-profile"]').click();await settle();
+    assert.deepEqual(createdBody,{name:'Research',reference:false});assert.equal(document.querySelector('[data-testid="account-profile"]').value,'research');assert.equal(document.querySelector('[data-testid="account-environment-separate"]').checked,true);assert.equal(document.querySelector('[data-testid="confirm-add-account"]').disabled,false);
+    document.querySelector('[data-testid="confirm-add-account"]').click();await settle();assert.deepEqual(addedBody,{accountId:'research',mode:'isolated'});
+  });
+});
+
+test('V2.1 DOM Profile save blocks Cancel and Escape while its request is pending',async()=>{
+  const personal={id:'personal',name:'Personal',archivedAt:null,trackingCoverage:{registeredDevices:1,reportingDevices:1,status:'full'},measured:{...ZERO},quota:unavailableQuota()},device={id:'device-1',name:'Laptop',currentGroupId:null,currentGroupName:null,disabledAt:null,lastSeenAt:'2026-09-04T12:00:00.000Z',state:'online',configurationStatus:'healthy',desiredRevision:1,appliedRevision:1,profiles:[{id:'personal-binding',accountId:'personal',name:'Personal',mode:'default',disabledAt:null,reference:false,measured:{...ZERO},trackingState:'tracking',lastActivityAt:null,actual:{state:'tracking',launcher:null,reportedAt:'2026-09-04T12:00:00.000Z'}}]};let resolveCreate;
+  const pendingCreate=new Promise(resolve=>{resolveCreate=resolve;});const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route==='/api/v1/devices/device-1')return jsonResponse(200,device);
+    if(route==='/api/v1/usage/devices/device-1?range=today')return jsonResponse(200,emptyUsage());
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts?range=all')return jsonResponse(200,{accounts:[personal]});
+    if(route==='/api/v1/accounts'&&method==='POST')return pendingCreate;
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/devices/device-1',fetchImpl},async({window,document,settle})=>{
+    document.querySelector('[data-testid="add-account"]').click();document.querySelector('[data-testid="new-profile-from-device"]').click();document.querySelector('[data-testid="profile-name"]').value='Research';document.querySelector('[data-testid="save-profile"]').click();await settle();
+    const dialog=document.querySelector('[data-testid="account-profile-dialog"]'),cancel=document.querySelector('[data-testid="cancel-profile"]');assert.equal(cancel.disabled,true);const cancelEvent=new window.Event('cancel',{cancelable:true});dialog.dispatchEvent(cancelEvent);assert.equal(cancelEvent.defaultPrevented,true);assert.equal(document.querySelectorAll('dialog').length,1);
+    resolveCreate(jsonResponse(201,{id:'research',name:'Research',reference:false,archivedAt:null}));await settle();assert.equal(document.querySelectorAll('[data-testid="account-profile-dialog"]').length,0);assert.equal(document.querySelectorAll('[data-testid="add-account-dialog"]').length,1);assert.equal(document.querySelector('[data-testid="account-profile"]').value,'research');
+  });
+});
+
 test('V2.1 DOM Device flow adds, stops, and re-adds a separate login',async()=>{
   let added=false,stopped=false,addedBody=null,addCount=0,deleteCount=0;const accounts=[{id:'personal',name:'Personal',archivedAt:null,trackingCoverage:{registeredDevices:1,reportingDevices:1,status:'full'},measured:{...ZERO},quota:unavailableQuota()},{id:'research',name:'Research',archivedAt:null,trackingCoverage:{registeredDevices:0,reportingDevices:0,status:'unknown'},measured:{...ZERO},quota:unavailableQuota()}];
   const profile=(accountId,name,mode,state,launcher=null,disabledAt=null)=>({id:`${accountId}-binding`,accountId,name,mode,disabledAt,reference:false,measured:{...ZERO},trackingState:state,lastActivityAt:null,actual:state==='waiting_for_agent'?null:{state:state==='login_required'?'login_required':'tracking',launcher,reportedAt:'2026-09-04T12:00:00.000Z'}});
@@ -163,10 +231,10 @@ test('V2.1 DOM Device flow adds, stops, and re-adds a separate login',async()=>{
   };
   await domFixture({url:'https://meter.example/#/devices/device-1',fetchImpl},async({document,settle})=>{
     document.querySelector('[data-testid="add-account"]').click();await settle();assert.ok(document.querySelector('[data-testid="add-account-dialog"]'));assert.equal(document.querySelector('[data-testid="account-environment-current"]').disabled,true);assert.equal(document.querySelector('[data-testid="account-environment-separate"]').checked,true);
-    document.querySelector('[data-testid="account-profile"]').value='research';document.querySelector('[data-testid="confirm-add-account"]').click();await settle();assert.deepEqual(addedBody,{accountId:'research',mode:'isolated'});
+    document.querySelector('[data-testid="account-profile"]').value='research';document.querySelector('[data-testid="account-profile"]').dispatchEvent(new document.defaultView.Event('change',{bubbles:true}));document.querySelector('[data-testid="confirm-add-account"]').click();await settle();assert.deepEqual(addedBody,{accountId:'research',mode:'isolated'});
     assert.deepEqual([...document.querySelectorAll('[data-testid="profile-research"] .login-command code')].map(node=>node.textContent),['"$HOME/.local/bin/cx2" login','"$HOME/Library/Application Support/Codex Meter/cx2" login','& "$env:LOCALAPPDATA\\CodexMeter\\cx2.ps1" login']);
     document.querySelector('[data-testid="stop-research"]').click();await settle();const dialog=document.querySelector('[data-testid="stop-tracking-dialog"]');assert.match(dialog.textContent,/Your Codex login and local data will not be deleted/);document.querySelector('[data-testid="confirm-stop"]').click();await settle();assert.equal(deleteCount,1);assert.match(document.querySelector('[data-testid="profile-research"]').textContent,/Not tracking/);
-    document.querySelector('[data-testid="add-account"]').click();await settle();document.querySelector('[data-testid="account-profile"]').value='research';document.querySelector('[data-testid="confirm-add-account"]').click();await settle();assert.equal(addCount,2);assert.deepEqual(addedBody,{accountId:'research',mode:'isolated'});assert.match(document.querySelector('[data-testid="profile-research"]').textContent,/Login required/);
+    document.querySelector('[data-testid="add-account"]').click();await settle();document.querySelector('[data-testid="account-profile"]').value='research';document.querySelector('[data-testid="account-profile"]').dispatchEvent(new document.defaultView.Event('change',{bubbles:true}));document.querySelector('[data-testid="confirm-add-account"]').click();await settle();assert.equal(addCount,2);assert.deepEqual(addedBody,{accountId:'research',mode:'isolated'});assert.match(document.querySelector('[data-testid="profile-research"]').textContent,/Login required/);
   });
 });
 
