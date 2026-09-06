@@ -18,7 +18,9 @@ export function validateManifest(value, target) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.version !== 'string' || !value.version) throw new Error('invalid release manifest');
   const artifact = value.artifacts?.[target];
   if (!artifact || typeof artifact.url !== 'string' || !artifact.url || typeof artifact.sha256 !== 'string' || !/^[a-fA-F0-9]{64}$/.test(artifact.sha256)) throw new Error(`release manifest has no valid artifact for ${target}`);
-  return { version: value.version, url: artifact.url, sha256: artifact.sha256.toLowerCase() };
+  const version=artifact.version??value.version;
+  if(typeof version!=='string'||!version)throw new Error('invalid artifact version');
+  return { version, url: artifact.url, sha256: artifact.sha256.toLowerCase() };
 }
 
 export function lifecyclePaths(platform = process.platform, env = process.env, home = os.homedir()) {

@@ -5,11 +5,13 @@ import { AgentCollector } from './collector.js';
 import { initializeManagedHome, profileLauncher } from './config.js';
 import { lifecyclePaths } from './lifecycle.js';
 import { canonicalHome, homesOverlap } from './paths.js';
+import { assertExistingLocation } from './existing-home.js';
+import { profileRootKey, readExistingRoot } from './existing-root.js';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
-const MODES = new Set(['default','isolated','preserve']);
+const MODES = new Set(['default','isolated','preserve','existing']);
 const CONFIG_STATUSES = new Set(['unknown','applying','healthy','apply_failed','migration_attention_required']);
-const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped']);
+const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped','local_selection_required']);
 
 function exact(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
@@ -27,9 +29,9 @@ export function validateDesiredConfiguration(value) {
   if(!Number.isSafeInteger(value.maxBatchSize)||value.maxBatchSize<1||value.maxBatchSize>100)throw new Error('invalid desired configuration');
   if(!Array.isArray(value.profiles)||value.profiles.length>64)throw new Error('invalid desired configuration');
   const profiles=value.profiles.map((profile)=>{
-    if(!exact(profile,['bindingId','accountId','name','mode']))throw new Error('invalid desired profile declaration');
+    if(!exact(profile,['bindingId','accountId','name','mode',...(profile?.mode==='existing'?['selectionKey']:[])]))throw new Error('invalid desired profile declaration');
     const mode=profile.mode;if(!MODES.has(mode))throw new Error('invalid desired profile mode');
-    return Object.freeze({bindingId:safeId(profile.bindingId,'bindingId'),accountId:safeId(profile.accountId,'accountId'),name:safeName(profile.name),mode});
+    return Object.freeze({bindingId:safeId(profile.bindingId,'bindingId'),accountId:safeId(profile.accountId,'accountId'),name:safeName(profile.name),mode,...(mode==='existing'?{selectionKey:safeId(profile.selectionKey,'selectionKey')}:{})});
   });
   if(new Set(profiles.map((p)=>p.bindingId)).size!==profiles.length||new Set(profiles.map((p)=>p.accountId)).size!==profiles.length)throw new Error('duplicate desired profile');
   if(profiles.filter((p)=>p.mode==='default').length>1)throw new Error('multiple default profiles are not allowed');
@@ -39,8 +41,12 @@ export function validateDesiredConfiguration(value) {
 export function assignmentRows(database,{activeOnly=true}={}){
   return database.prepare(`SELECT * FROM profile_assignments ${activeOnly?'WHERE active=1':''} ORDER BY mode='default' DESC,created_at,binding_id`).all().map((row)=>({
     bindingId:row.binding_id,accountId:row.account_id,name:row.name,mode:row.mode,origin:row.origin,localHome:row.local_home,
-    launcherName:row.launcher_name,active:Boolean(row.active),desiredRevision:row.desired_revision,appliedRevision:row.applied_revision,state:row.state,createdAt:row.created_at,updatedAt:row.updated_at
-  }));
+    launcherName:row.launcher_name,active:Boolean(row.active),desiredRevision:row.desired_revision,appliedRevision:row.applied_revision,state:row.state,createdAt:row.created_at,updatedAt:row.updated_at,selectionKey:row.selection_key
+  })).map(profile=>{
+    if(profile.mode!=='existing')return profile;
+    const rootIdentity=readExistingRoot(database,profileRootKey(profile),profile.localHome);
+    return {...profile,rootIdentity,...(profile.active&&profile.localHome&&!rootIdentity?{localHome:null,state:'local_selection_required'}:{})};
+  });
 }
 
 export function configurationState(database){
@@ -101,14 +107,23 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
     return{applied:false,error,...configurationState(database)};
   }
   if(desired.revision<currentDesired)return{ignored:true,reason:'older_revision',...configurationState(database)};
-  if(desired.revision===currentApplied&&desired.revision===currentDesired)return{idempotent:true,...configurationState(database)};
+  state(database,'desired_configuration',JSON.stringify(desired),clock);
+  const localRevision=stateValue(database,'local_selection_revision','0');
+  if(desired.revision===currentApplied&&desired.revision===currentDesired&&localRevision===stateValue(database,'applied_local_selection_revision','0'))return{idempotent:true,...configurationState(database)};
   state(database,'desired_config_revision',desired.revision,clock);state(database,'configuration_status','applying',clock);state(database,'configuration_error_kind','',clock);
   const existing=assignmentRows(database,{activeOnly:false}),byAccount=new Map(existing.map((row)=>[row.accountId,row])),planned=[];
   try{
     for(const declaration of desired.profiles){
       const previous=byAccount.get(declaration.accountId);
       let mode=declaration.mode,origin='server',localHome,launcherName=previous?.launcherName??null,initialize=false;
-      if(previous?.origin==='imported'&&(declaration.mode==='preserve'||declaration.mode==='isolated')){mode='preserve';origin='imported';localHome=previous.localHome;}
+      if(declaration.mode==='existing'){
+        origin='adopted';launcherName=null;
+        const selection=database.prepare('SELECT canonical_home FROM existing_home_selections WHERE binding_id=? AND account_id=? AND selection_key=?').get(declaration.bindingId,declaration.accountId,declaration.selectionKey);
+        const selected=selection&&readExistingRoot(database,profileRootKey(declaration),selection.canonical_home);
+        if(selected)await assertExistingLocation(selection.canonical_home);
+        localHome=selected?selection.canonical_home:null;
+      }
+      else if(previous?.origin==='imported'&&(declaration.mode==='preserve'||declaration.mode==='isolated')){mode='preserve';origin='imported';localHome=previous.localHome;}
       else if(declaration.mode==='default'){localHome=config.codexHome;launcherName=null;}
       else if(declaration.mode==='preserve'&&previous){mode=previous.mode;origin=previous.origin;localHome=previous.localHome;}
       else if(declaration.mode==='preserve'&&existing.length===0&&(config.profiles?.length??0)===0&&desired.profiles.length===1){mode='preserve';origin='imported';localHome=config.codexHome;launcherName=null;}
@@ -117,15 +132,16 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
       planned.push({...declaration,mode,origin,localHome,launcherName,initialize});
     }
     const canonicalHomes=[];
-    for(const entry of planned)canonicalHomes.push(await canonicalHome(entry.localHome,{platform}));
-    if(new Set(canonicalHomes).size!==canonicalHomes.length)throw new Error('profile homes overlap');
+    for(const entry of planned)canonicalHomes.push(entry.localHome===null?null:await canonicalHome(entry.localHome,{platform}));
+    if(new Set(canonicalHomes.filter(Boolean)).size!==canonicalHomes.filter(Boolean).length)throw new Error('profile homes overlap');
     for(let left=0;left<canonicalHomes.length;left++)for(let right=left+1;right<canonicalHomes.length;right++){
-      if(homesOverlap(canonicalHomes[left],canonicalHomes[right]))throw new Error('profile homes overlap');
+      if(canonicalHomes[left]&&canonicalHomes[right]&&homesOverlap(canonicalHomes[left],canonicalHomes[right]))throw new Error('profile homes overlap');
     }
-    const protectedDefault=await canonicalHome(config.codexHome,{platform});
+    const protectedDefault=planned.some(entry=>entry.initialize)?await canonicalHome(config.codexHome,{platform}):null;
     for(let index=0;index<planned.length;index++)if(planned[index].initialize&&homesOverlap(canonicalHomes[index],protectedDefault))throw new Error('managed profile overlaps default home');
     for(const entry of planned)if(entry.initialize){await initializeManagedHome(entry.localHome,entry.accountId);if(!entry.launcherName){const created=await createLauncher({codexHome:entry.localHome,codexExecutable:config.codexExecutable},{directory:launcherDirectory,platform});entry.launcherName=created.name;}}
     for(const entry of planned){
+      if(entry.mode==='existing')continue; // Only the explicit local attach establishes its EOF baseline.
       const prior=byAccount.get(entry.accountId),reactivated=prior&&!prior.active,homeChanged=prior&&prior.localHome!==entry.localHome;
       const changed=!prior||reactivated||prior.bindingId!==entry.bindingId||homeChanged;
       if(changed){const collector=new AgentCollector(database,{home:entry.localHome,accountId:entry.accountId,clock});await (baseline?baseline(collector,entry):reactivated||homeChanged?collector.baselineCurrent():collector.reconcile());}
@@ -133,12 +149,24 @@ export async function applyDesiredConfiguration(database,config,raw,{clock=Date.
     const now=new Date(clock()).toISOString();database.exec('BEGIN IMMEDIATE');
     try{
       database.prepare('UPDATE profile_assignments SET active=0,state=\'stopped\',updated_at=? WHERE active=1').run(now);
-      const insert=database.prepare(`INSERT INTO profile_assignments(binding_id,account_id,name,mode,origin,local_home,launcher_name,active,desired_revision,applied_revision,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-      for(const entry of planned){const prior=byAccount.get(entry.accountId),runtimeState=prior?.active&&PROFILE_STATES.has(prior.state)&&!['stopped','apply_failed'].includes(prior.state)?prior.state:'tracking';database.prepare('DELETE FROM profile_assignments WHERE binding_id=?').run(entry.bindingId);insert.run(entry.bindingId,entry.accountId,entry.name,entry.mode,entry.origin,entry.localHome,entry.launcherName,1,desired.revision,desired.revision,runtimeState,prior?.createdAt??now,now);}
+      const insert=database.prepare(`INSERT INTO profile_assignments(binding_id,account_id,name,mode,origin,local_home,launcher_name,active,desired_revision,applied_revision,state,created_at,updated_at,selection_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for(const entry of planned){const prior=byAccount.get(entry.accountId),runtimeState=entry.localHome===null?'local_selection_required':prior?.active&&prior.localHome===entry.localHome&&PROFILE_STATES.has(prior.state)&&!['stopped','apply_failed','local_selection_required'].includes(prior.state)?prior.state:'tracking';database.prepare('DELETE FROM profile_assignments WHERE binding_id=?').run(entry.bindingId);insert.run(entry.bindingId,entry.accountId,entry.name,entry.mode,entry.origin,entry.localHome,entry.launcherName,1,desired.revision,desired.revision,runtimeState,prior?.createdAt??now,now,entry.selectionKey??null);}
+      database.prepare(`DELETE FROM existing_home_selections WHERE NOT EXISTS(SELECT 1 FROM profile_assignments a WHERE a.active=1 AND a.mode='existing' AND a.binding_id=existing_home_selections.binding_id AND a.selection_key=existing_home_selections.selection_key)`).run();
+      state(database,'applied_local_selection_revision',localRevision,clock);
       state(database,'applied_config_revision',desired.revision,clock);state(database,'configuration_status','healthy',clock);state(database,'configuration_error_kind','',clock);database.exec('COMMIT');
     }catch(error){database.exec('ROLLBACK');throw error;}
     return{applied:true,...configurationState(database)};
-  }catch(error){state(database,'configuration_status','apply_failed',clock);state(database,'configuration_error_kind','profile_apply_failed',clock);return{applied:false,error,...configurationState(database)};}
+  }catch(error){
+    // Local selection may fail after this declarative revision was already
+    // applied (as unresolved). Do not manufacture a failed remote revision:
+    // that state is invalid on the wire and would prevent remote recovery.
+    const localFailure=desired.revision===currentApplied;
+    if(localFailure)database.prepare(`UPDATE profile_assignments SET state='apply_failed',updated_at=?
+      WHERE active=1 AND mode='existing' AND local_home IS NULL AND EXISTS(
+        SELECT 1 FROM existing_home_selections s WHERE s.binding_id=profile_assignments.binding_id
+        AND s.selection_key=profile_assignments.selection_key)`).run(new Date(clock()).toISOString());
+    state(database,'configuration_status',localFailure?'healthy':'apply_failed',clock);state(database,'configuration_error_kind','profile_apply_failed',clock);return{applied:false,error,...configurationState(database)};
+  }
 }
 
 export async function inspectLauncher(filename){return readFile(filename,'utf8');}

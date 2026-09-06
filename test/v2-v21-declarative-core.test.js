@@ -114,7 +114,7 @@ test('Core runtime serializes reconcile/sync/configuration races and preserves l
   const config={codexHome:path.join(root,'.codex'),databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex'),profiles:[],reconcileIntervalMs:999999,syncIntervalMs:999999,heartbeatIntervalMs:999999};
   const runtime=new AgentRuntime(database,config,{collectorFactory,syncClient,watchImpl,applyOptions:{clock:()=>NOW,baseline:async()=>{},isolatedRoot:(_config,binding)=>path.join(root,'profiles',binding),launcherDirectory:path.join(root,'bin'),platform:'linux'}});
   const collecting=runtime.reconcile(),syncing=runtime.sync(true);await new Promise(resolve=>setImmediate(resolve));assert.equal(syncCalls,0);releaseReconcile();await collecting;await syncing;assert.equal(configurationState(database).appliedRevision,1);assert.equal(database.prepare('SELECT COUNT(*) count FROM usage_outbox').get().count,1);
-  const collectorCount=runtime.collectors.length;await runtime.applyConfiguration(response);assert.equal(runtime.collectors.length,collectorCount);assert.equal(configureCalls,1);
+  const collectorCount=runtime.collectors.length,configuredBefore=configureCalls;await runtime.applyConfiguration(response);assert.equal(runtime.collectors.length,collectorCount);assert.equal(configureCalls,configuredBefore);
   runtime.running=true;runtime.refreshWatchers();assert.equal(openWatchers,3);
   releaseSync=()=>{};response=desired(2,[{bindingId:'a',accountId:'a',name:'A',mode:'default'},{bindingId:'b',accountId:'b',name:'B',mode:'isolated'}]);const blockedSync=runtime.sync(true);await new Promise(resolve=>setImmediate(resolve));runtime.trigger();assert.equal(reconciles,1);releaseSync();await blockedSync;await runtime.operation;
   assert.equal(runtime.collectors.length,2,JSON.stringify(configurationState(database)));assert.equal(openWatchers,6);assert.equal(reconciles,3);while(syncCalls<3)await new Promise(resolve=>setImmediate(resolve));
@@ -171,6 +171,23 @@ test('Core runtime start leaves an absent default home untouched after declarati
   const defaultHome=path.join(root,'untracked-default'),config={codexHome:defaultHome,databasePath:path.join(root,'agent.db'),codexExecutable:path.join(root,'codex'),profiles:[],reconcileIntervalMs:999999,syncIntervalMs:999999,heartbeatIntervalMs:999999};
   await applyDesiredConfiguration(database,config,desired(1,[]),{clock:()=>NOW});const configured=[];const runtime=new AgentRuntime(database,config,{syncClient:{configureProfiles(rows){configured.push(rows);},async sync(){return{configuration:null};}},watchImpl:()=>{throw new Error('untracked home must not be watched');}});
   await runtime.start();assert.deepEqual(runtime.collectors,[]);assert.deepEqual(configured.at(-1),[]);await assert.rejects(stat(defaultHome));await runtime.stop();
+}));
+
+test('Watcher bursts coalesce and cannot queue hundreds of scans ahead of a heartbeat',()=>tempDatabase(async({root,database})=>{
+  let release;const gate=new Promise(resolve=>{release=resolve;});let scans=0;const actions=[];
+  const runtime=new AgentRuntime(database,{codexHome:root},{fixedCollectors:true,collector:{home:root,async reconcile(){scans++;actions.push('scan');if(scans===1)await gate;}},syncClient:{async sync({heartbeat}){actions.push(heartbeat?'heartbeat':'sync');return{};}}});
+  runtime.running=true;
+  const burst=runtime.trigger();for(let i=0;i<1000;i++)assert.equal(runtime.trigger(),burst);
+  const heartbeat=runtime.sync(true);release();await heartbeat;await burst;await runtime.triggerWork;
+  assert.equal(scans,2);assert.deepEqual(actions,['scan','heartbeat','sync','scan','sync']);
+  await runtime.stop();await runtime.trigger();assert.equal(scans,2);
+}));
+
+test('Startup immediately connects and acknowledges configuration without waiting for Codex quota',()=>tempDatabase(async({root,database})=>{
+  const config={serverUrl:'https://meter.example',deviceId:'device',deviceSecret:'x'.repeat(32),codexHome:path.join(root,'default'),databasePath:path.join(root,'agent.db'),maxBatchSize:100,reconcileIntervalMs:999999,syncIntervalMs:999999,heartbeatIntervalMs:999999};
+  const bodies=[];let quotaCalls=0;
+  const runtime=new AgentRuntime(database,config,{watchImpl:()=>({close(){}}),quotaReporter:{async observe(){quotaCalls++;throw new Error('quota must not delay connection');}},fetchImpl:async(_url,options)=>{bodies.push(JSON.parse(options.body));return new Response(JSON.stringify({acceptedEventIds:[],duplicateEventIds:[],isQuotaReporter:true,serverCapabilities:CAPS,agentConfiguration:desired(1,[])}),{status:200,headers:{'content-type':'application/json'}});}});
+  try{await runtime.start();assert.equal(bodies.length,2);assert.equal(quotaCalls,0);assert.equal(bodies[1].configurationState.appliedRevision,1);assert.equal(database.prepare("SELECT value FROM agent_state WHERE key='last_sync_status'").get().value,'ok');}finally{await runtime.stop();}
 }));
 
 test('Core applied empty declarative config cannot resurrect the legacy quota reporter after restart',()=>tempDatabase(async({root,database})=>{

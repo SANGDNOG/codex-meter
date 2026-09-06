@@ -12,4 +12,38 @@
 - **Backup:** stop the service and copy `/data/meter.db` with its WAL sidecars, or use a SQLite online backup. Never substitute rollout JSONL or `auth.json` as a diagnostic backup.
 - **Release/update failure:** retain the existing executable, verify manifest/artifact reachability and SHA-256, then retry. A checksum mismatch is a hard failure.
 
+## Linux / WSL connection recovery (Agent 2.1.2)
+
+`active (running)` confirms the process, not a successful Server connection. Run:
+
+```sh
+~/.local/bin/codex-meter-agent status --config ~/.local/state/codex-meter/agent.json
+journalctl --user -u codex-meter-agent.service -n 60 --no-pager
+```
+
+Check `connection.status`, `connection.errorKind`, and `connection.lastSuccessAt`.
+`http_400` with `invalid_configuration_revision` can mean that credentials for a
+new Device were paired with the previous Device's database. Updating alone does
+not reset that state. Do not delete the database or reassign its pending events
+to a different Device. Preserve the existing configuration and database before
+recovering the new Device's connection.
+
+Starting with 2.1.2, enrollment allocates an `agent-<deviceId>.db` database for each
+new Device and backs up a previous configuration as `agent.json.before-enroll-*`.
+Previous databases and Codex homes remain untouched. Treat configuration backups
+as credentials. The Linux installer checks user systemd before consuming the token
+and restarts an already-running service after enrollment.
+
+The Agent sends a startup handshake without waiting for quota collection or the
+first scheduled heartbeat. Repeated filesystem notifications are coalesced so
+large Codex sessions cannot queue unbounded scans ahead of status reports.
+The Dashboard distinguishes registration from the first successful Agent report;
+device details keep polling through offline and online states without replacing
+the page or form fields. Reload an already-open tab after a Dashboard deployment.
+
+For multiple Codex homes, inspect `trackedProfiles` in local Agent status. It lists
+the active assignments and their actual `codexHome` paths. `profiles: []` is only
+the legacy manual-config list and does not mean no declarative profiles exist.
+Quota `not_authenticated` concerns the selected Codex home, not Server connectivity.
+
 Measured Group share and estimated quota contribution are not provider attribution. The contribution estimate allocates provider-reported account usage by locally tracked token share and may be incomplete when registered Devices are not reporting. There is no quota enforcement.

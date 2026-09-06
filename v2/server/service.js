@@ -11,9 +11,9 @@ const SAFE_METADATA = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const QUOTA_STATUSES = new Set(['available', 'ambiguous', 'unavailable']);
 const QUOTA_ERROR_KINDS = new Set(['codex_not_found','app_server_timeout','app_server_unavailable','not_authenticated','malformed_rate_limits','ambiguous_limits']);
 const PLAN_TYPES = new Set(['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu']);
-const BINDING_MODES = new Set(['default','isolated','legacy']);
+const BINDING_MODES = new Set(['default','isolated','legacy','existing']);
 const CONFIG_STATUSES = new Set(['unknown','applying','healthy','apply_failed','migration_attention_required']);
-const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped']);
+const PROFILE_STATES = new Set(['tracking','login_required','quota_available','quota_unavailable','apply_failed','migration_attention_required','stopped','local_selection_required']);
 const REPORTING_PROFILE_STATES = new Set(['tracking','quota_available','quota_unavailable']);
 const SAFE_LOGICAL_LAUNCHER = /^cx[1-9][0-9]{0,2}$/;
 
@@ -90,7 +90,8 @@ function parseQuotaReport(value) {
 }
 function parseCapabilities(value) {
   if(value===undefined)return{agentConfigurationSchema:null,declarativeProfiles:false,actualState:false};
-  exact(value,['agentConfigurationSchema','declarativeProfiles','actualState']);
+  exact(value,['agentConfigurationSchema','declarativeProfiles','actualState'],['existingHomeSelection']);
+  if(value.existingHomeSelection!==undefined&&value.existingHomeSelection!==true)fail(400,'invalid_capabilities');
   if(value.agentConfigurationSchema!==1||value.declarativeProfiles!==true||typeof value.actualState!=='boolean')fail(400,'invalid_capabilities');
   return value;
 }
@@ -102,7 +103,7 @@ function parseConfigurationState(value) {
   if(value.status==='healthy'&&value.appliedRevision!==value.desiredRevision)fail(400,'invalid_configuration_state');
   if(value.status==='apply_failed'&&(!errorKind||value.appliedRevision===value.desiredRevision))fail(400,'invalid_configuration_state');
   if(!Array.isArray(value.profiles)||value.profiles.length>64)fail(400,'invalid_configuration_state');
-  const profiles=value.profiles.map((profile)=>{exact(profile,['bindingId','accountId','mode','state'],['launcher']);if(!['default','isolated','preserve'].includes(profile.mode)||!PROFILE_STATES.has(profile.state))fail(400,'invalid_configuration_state');const launcher=profile.launcher===undefined?null:metadata(profile.launcher,'launcher');if((launcher!==null&&!SAFE_LOGICAL_LAUNCHER.test(launcher))||(profile.mode==='default'&&launcher!==null))fail(400,'invalid_configuration_state');return{bindingId:id(profile.bindingId,'bindingId'),accountId:id(profile.accountId,'accountId'),mode:profile.mode,state:profile.state,launcher};});
+  const profiles=value.profiles.map((profile)=>{exact(profile,['bindingId','accountId','mode','state'],['launcher']);if(!['default','isolated','preserve','existing'].includes(profile.mode)||!PROFILE_STATES.has(profile.state))fail(400,'invalid_configuration_state');const launcher=profile.launcher===undefined?null:metadata(profile.launcher,'launcher');if((launcher!==null&&!SAFE_LOGICAL_LAUNCHER.test(launcher))||(['default','existing'].includes(profile.mode)&&launcher!==null)||(profile.state==='local_selection_required'&&profile.mode!=='existing'))fail(400,'invalid_configuration_state');return{bindingId:id(profile.bindingId,'bindingId'),accountId:id(profile.accountId,'accountId'),mode:profile.mode,state:profile.state,launcher};});
   if(new Set(profiles.map((profile)=>profile.bindingId)).size!==profiles.length)fail(400,'invalid_configuration_state');
   return{desiredRevision:value.desiredRevision,appliedRevision:value.appliedRevision,status:value.status,errorKind,profiles};
 }
@@ -230,7 +231,8 @@ export class MeterService {
 
   listAccounts(rangeValue = 'all') {
     return this.database.prepare('SELECT * FROM accounts ORDER BY name,id').all().map((row) => {
-      const devices=this.database.prepare('SELECT COUNT(*) count FROM device_account_bindings WHERE account_id=? AND disabled_at IS NULL').get(row.id).count;
+      const devices=this.database.prepare(`SELECT COUNT(*) count FROM device_account_bindings b JOIN devices d ON d.id=b.device_id
+        WHERE b.account_id=? AND b.disabled_at IS NULL AND d.removed_at IS NULL`).get(row.id).count;
       return {...accountWire(row),devices,measured:this.usage(rangeValue,{accountId:row.id}).measured,quota:this.accountQuota(row.id),trackingCoverage:this.trackingCoverage(row.id)};
     });
   }
@@ -239,7 +241,7 @@ export class MeterService {
     const row = this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);
     if (!row) fail(404, 'account_not_found');
     const devices = this.database.prepare(`SELECT b.*,d.name device_name FROM device_account_bindings b
-      JOIN devices d ON d.id=b.device_id WHERE b.account_id=? ORDER BY d.name,d.id`).all(accountId).map((binding) => {
+      JOIN devices d ON d.id=b.device_id WHERE b.account_id=? AND d.removed_at IS NULL ORDER BY d.name,d.id`).all(accountId).map((binding) => {
       const device=this.database.prepare('SELECT d.*,g.name group_name FROM devices d LEFT JOIN groups g ON g.id=d.current_group_id WHERE d.id=?').get(binding.device_id);
       return {...bindingWire(binding),name:binding.device_name,measured:this.usage(rangeValue,{accountId,deviceId:binding.device_id}).measured,...this.profilePresentation(device,binding)};
     });
@@ -259,24 +261,44 @@ export class MeterService {
     id(accountId,'accountId');exact(body,[],['name','reference','archived']);if(!Object.keys(body).length)fail(400,'invalid_body');const row=this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);if(!row)fail(404,'account_not_found');
     if('reference'in body&&typeof body.reference!=='boolean')fail(400,'invalid_field');if('archived'in body&&typeof body.archived!=='boolean')fail(400,'invalid_field');
     const name='name'in body?text(body.name,'name'):row.name,reference='reference'in body?(body.reference?1:0):row.reference,archived='archived'in body?(body.archived?nowIso(this.clock):null):row.archived_at,now=nowIso(this.clock);
-    try{tx(this.database,()=>{this.database.prepare('UPDATE accounts SET name=?,reference=?,archived_at=?,updated_at=? WHERE id=?').run(name,reference,archived,now,accountId);if(name!==row.name||archived!==row.archived_at)this.publishAccountDeviceConfigurations(accountId);});}
+    try{tx(this.database,()=>{
+      this.database.prepare('UPDATE accounts SET name=?,reference=?,archived_at=?,updated_at=? WHERE id=?').run(name,reference,archived,now,accountId);
+      if(archived!==null){
+        const affected=this.database.prepare('SELECT DISTINCT device_id FROM device_account_bindings WHERE account_id=? AND disabled_at IS NULL').all(accountId);
+        // The existing disable trigger closes binding periods. Retain history,
+        // but release active/default slots; unarchive never opts tracking in.
+        this.database.prepare('UPDATE device_account_bindings SET disabled_at=? WHERE account_id=? AND disabled_at IS NULL').run(now,accountId);
+        for(const {device_id:deviceId} of affected)this.publishDeviceConfiguration(deviceId);
+      }else if(name!==row.name||archived!==row.archived_at)this.publishAccountDeviceConfigurations(accountId);
+    });}
     catch(error){if(String(error).includes('UNIQUE'))fail(409,reference?'reference_exists':'account_name_exists');throw error;}return accountWire(this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId));
   }
   publishDeviceConfiguration(deviceId,{sourceRevision=null}={}){
     const now=nowIso(this.clock),device=this.database.prepare('SELECT desired_config_revision FROM devices WHERE id=?').get(deviceId);if(!device)fail(404,'device_not_found');
-    const revision=device.desired_config_revision+1;
+    let revision=device.desired_config_revision+1;
     this.database.prepare('UPDATE devices SET desired_config_revision=?,updated_at=? WHERE id=?').run(revision,now,deviceId);
     this.database.prepare(`INSERT INTO device_configuration_revisions(device_id,revision,schema_version,sync_interval_seconds,heartbeat_interval_seconds,max_batch_size,created_at)
       VALUES(?,?,1,15,60,100,?)`).run(deviceId,revision,now);
     if(sourceRevision===null){
-      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode)
-        SELECT b.device_id,?,b.id,b.account_id,a.name,b.mode FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id
+      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode,selection_key)
+        SELECT b.device_id,?,b.id,b.account_id,a.name,b.mode,b.selection_key FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id
         WHERE b.device_id=? AND b.disabled_at IS NULL AND a.archived_at IS NULL ORDER BY b.created_at,b.id`).run(revision,deviceId);
     }else{
       if(!Number.isSafeInteger(sourceRevision)||sourceRevision<1)fail(400,'invalid_configuration_revision');
       const source=this.database.prepare('SELECT 1 FROM device_configuration_revisions WHERE device_id=? AND revision=?').get(deviceId,sourceRevision);if(!source)fail(404,'configuration_revision_not_found');
-      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode)
-        SELECT device_id,?,binding_id,account_id,name,mode FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).run(revision,deviceId,sourceRevision);
+      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode,selection_key)
+        SELECT device_id,?,binding_id,account_id,name,mode,selection_key FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).run(revision,deviceId,sourceRevision);
+    }
+    if(this.database.prepare("SELECT 1 FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? AND mode='existing'").get(deviceId,revision)){
+      // Publish a distinct compatible revision before the complete revision.
+      // Old Agents receive current explicit stops/additions for their supported
+      // profiles, while an upgrade always advances to a new complete revision.
+      this.database.prepare(`INSERT INTO device_configuration_revisions(device_id,revision,schema_version,sync_interval_seconds,heartbeat_interval_seconds,max_batch_size,created_at)
+        SELECT device_id,revision+1,schema_version,sync_interval_seconds,heartbeat_interval_seconds,max_batch_size,created_at FROM device_configuration_revisions WHERE device_id=? AND revision=?`).run(deviceId,revision);
+      this.database.prepare(`INSERT INTO device_configuration_revision_profiles(device_id,revision,binding_id,account_id,name,mode,selection_key)
+        SELECT device_id,revision+1,binding_id,account_id,name,mode,selection_key FROM device_configuration_revision_profiles WHERE device_id=? AND revision=?`).run(deviceId,revision);
+      this.database.prepare("DELETE FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? AND mode='existing'").run(deviceId,revision);
+      revision+=1;this.database.prepare('UPDATE devices SET desired_config_revision=? WHERE id=?').run(revision,deviceId);
     }
     return revision;
   }
@@ -298,9 +320,9 @@ export class MeterService {
     const now=nowIso(this.clock),binding={id:existing?.id??randomUUID(),deviceId,accountId,mode:mode==='legacy'?'preserve':mode,createdAt:existing?.created_at??now,disabledAt:null};
     try{tx(this.database,()=>{
       if(existing){
-        this.database.prepare('UPDATE device_account_bindings SET mode=?,disabled_at=NULL WHERE id=?').run(mode,existing.id);
+        this.database.prepare('UPDATE device_account_bindings SET mode=?,selection_key=?,disabled_at=NULL WHERE id=?').run(mode,mode==='existing'?randomUUID():null,existing.id);
         this.database.prepare('INSERT INTO device_account_binding_periods(binding_id,valid_from) VALUES(?,?)').run(existing.id,now);
-      }else this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(binding.id,deviceId,accountId,body.codexHomeKey??randomUUID(),mode,now);
+      }else this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at,selection_key) VALUES(?,?,?,?,?,?,?)').run(binding.id,deviceId,accountId,body.codexHomeKey??randomUUID(),mode,now,mode==='existing'?randomUUID():null);
       this.publishDeviceConfiguration(deviceId);
     });}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_mode_conflict');throw error;}return binding;
   }
@@ -309,12 +331,13 @@ export class MeterService {
     if(row.disabled_at)return bindingWire(row);const now=nowIso(this.clock);tx(this.database,()=>{this.database.prepare('UPDATE device_account_bindings SET disabled_at=? WHERE id=?').run(now,bindingId);this.publishDeviceConfiguration(deviceId);});return bindingWire(this.database.prepare('SELECT * FROM device_account_bindings WHERE id=?').get(bindingId));
   }
   activeBinding(deviceId,accountId){return this.database.prepare(`SELECT b.id FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id WHERE b.device_id=? AND b.account_id=? AND b.disabled_at IS NULL AND a.archived_at IS NULL`).get(deviceId,accountId);}
-  desiredConfiguration(deviceId){
+  desiredConfiguration(deviceId,existingHomeSelection=true){
     const device=this.database.prepare('SELECT desired_config_revision FROM devices WHERE id=?').get(deviceId);if(!device)fail(404,'device_not_found');
+    if(!existingHomeSelection)device.desired_config_revision=this.database.prepare(`SELECT coalesce(MAX(r.revision),0) revision FROM device_configuration_revisions r WHERE r.device_id=? AND r.revision<=? AND NOT EXISTS(SELECT 1 FROM device_configuration_revision_profiles p WHERE p.device_id=r.device_id AND p.revision=r.revision AND p.mode='existing')`).get(deviceId,device.desired_config_revision).revision;
     if(device.desired_config_revision===0)return{schemaVersion:1,revision:0,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles:[]};
     const revision=this.database.prepare('SELECT * FROM device_configuration_revisions WHERE device_id=? AND revision=?').get(deviceId,device.desired_config_revision);if(!revision)fail(500,'configuration_revision_missing');
-    const profiles=this.database.prepare(`SELECT binding_id,account_id,name,mode FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).all(deviceId,revision.revision)
-      .map((row)=>({bindingId:row.binding_id,accountId:row.account_id,name:row.name,mode:row.mode==='legacy'?'preserve':row.mode}));
+    const profiles=this.database.prepare(`SELECT binding_id,account_id,name,mode,selection_key FROM device_configuration_revision_profiles WHERE device_id=? AND revision=? ORDER BY binding_id`).all(deviceId,revision.revision)
+      .map((row)=>({bindingId:row.binding_id,accountId:row.account_id,name:row.name,mode:row.mode==='legacy'?'preserve':row.mode,...(row.mode==='existing'?{selectionKey:row.selection_key}:{})}));
     return{schemaVersion:revision.schema_version,revision:revision.revision,syncIntervalSeconds:revision.sync_interval_seconds,heartbeatIntervalSeconds:revision.heartbeat_interval_seconds,maxBatchSize:revision.max_batch_size,profiles};
   }
   createGroup(body) {
@@ -338,7 +361,7 @@ export class MeterService {
     exact(body, ['name'], ['groupId', 'expiresInSeconds','accountId','mode']); const name = text(body.name, 'name'); const groupId = body.groupId == null ? null : id(body.groupId, 'groupId');
     if (groupId && !this.database.prepare('SELECT id FROM groups WHERE id=? AND archived_at IS NULL').get(groupId)) fail(400, 'invalid_group');
     const accountId=body.accountId==null?null:id(body.accountId,'accountId');if(accountId&&!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');
-    const mode=accountId?(body.mode??'default'):null;if(mode!==null&&!['default','isolated'].includes(mode))fail(400,'invalid_mode');if(!accountId&&body.mode!==undefined)fail(400,'invalid_mode');
+    const mode=accountId?(body.mode??'default'):null;if(mode!==null&&!['default','isolated','existing'].includes(mode))fail(400,'invalid_mode');if(!accountId&&body.mode!==undefined)fail(400,'invalid_mode');
     let ttl = this.enrollmentTtlMs;
     if ('expiresInSeconds' in body) { if (!Number.isInteger(body.expiresInSeconds) || body.expiresInSeconds < 1 || body.expiresInSeconds > 3600) fail(400, 'invalid_field'); ttl = body.expiresInSeconds * 1000; }
     const raw = secret(); const tokenSalt = salt(); const enrollmentId = randomUUID(); const createdAt = nowIso(this.clock); const expiresAt = new Date(this.clock() + ttl).toISOString();
@@ -349,7 +372,7 @@ export class MeterService {
 
   enroll(body, capabilitiesValue) {
     exact(body, ['token']); const raw = text(body.token, 'token', 200); const now = nowIso(this.clock);
-    const declarative=parseCapabilities(capabilitiesValue).declarativeProfiles;
+    const capabilities=parseCapabilities(capabilitiesValue),declarative=capabilities.declarativeProfiles;
     return tx(this.database, () => {
       let enrollment = null;
       for (const row of this.database.prepare('SELECT * FROM device_enrollments WHERE consumed_at IS NULL').all()) {
@@ -357,6 +380,7 @@ export class MeterService {
       }
       if (!enrollment) fail(401, 'invalid_enrollment');
       if (enrollment.expires_at <= now) fail(410, 'enrollment_expired');
+      if(enrollment.binding_mode==='existing'&&!capabilities.existingHomeSelection)fail(426,'compatible_agent_required');
       const consumed = this.database.prepare('UPDATE device_enrollments SET consumed_at=? WHERE id=? AND consumed_at IS NULL').run(now, enrollment.id);
       if (consumed.changes !== 1) fail(409, 'enrollment_used');
       const deviceId = randomUUID(); const deviceSecret = secret(); const credentialSalt = salt();
@@ -364,10 +388,11 @@ export class MeterService {
         VALUES (?,?,?,?,?,?,?,?)`).run(deviceId, enrollment.device_name, hashSecret(deviceSecret, credentialSalt), credentialSalt, enrollment.group_id,0, now, now);
       if (enrollment.group_id) this.database.prepare('INSERT INTO device_group_memberships (id,device_id,group_id,valid_from) VALUES (?,?,?,?)')
         .run(randomUUID(), deviceId, enrollment.group_id, now);
-      if(enrollment.account_id){this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES(?,?,?,?,?,?)').run(randomUUID(),deviceId,enrollment.account_id,randomUUID(),enrollment.binding_mode,now);this.publishDeviceConfiguration(deviceId);}
+      this.database.prepare('UPDATE devices SET existing_home_supported=? WHERE id=?').run(capabilities.existingHomeSelection?1:0,deviceId);
+      if(enrollment.account_id){this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at,selection_key) VALUES(?,?,?,?,?,?,?)').run(randomUUID(),deviceId,enrollment.account_id,randomUUID(),enrollment.binding_mode,now,enrollment.binding_mode==='existing'?randomUUID():null);this.publishDeviceConfiguration(deviceId);}
       this.database.prepare('UPDATE device_enrollments SET device_id=? WHERE id=?').run(deviceId, enrollment.id);
       return { deviceId, deviceSecret, serverUrl: this.serverUrl, agentConfiguration: declarative?this.desiredConfiguration(deviceId):this.configuration(),
-        ...(declarative?{serverCapabilities:SERVER_CAPABILITIES}:{}) };
+        ...(declarative?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}) };
     });
   }
 
@@ -396,10 +421,12 @@ export class MeterService {
     const deviceView=this.deviceWire(device),lastActivityAt=this.database.prepare('SELECT MAX(occurred_at) value FROM usage_events WHERE device_id=? AND account_id=?').get(device.id,binding.account_id).value??null;
     let trackingState;
     if(binding.disabled_at)trackingState=actual&&deviceView.appliedRevision<deviceView.desiredRevision?'stop_tracking_pending':'stopped';
+    else if(binding.mode==='existing'&&!device.existing_home_supported)trackingState='waiting_for_compatible_agent';
     else if(!device.last_seen_at)trackingState='waiting_for_agent';
+    else if(deviceView.state!=='online')trackingState='agent_offline';
     else if(!actual&&deviceView.configurationStatus==='apply_failed')trackingState='apply_failed';
     else if(!actual)trackingState='applying';
-    else if(deviceView.state!=='online')trackingState='agent_offline';
+    else if(actual.state==='local_selection_required')trackingState='local_selection_required';
     else if(actual.state==='login_required')trackingState='login_required';
     else if(actual.state==='quota_unavailable')trackingState='quota_unavailable';
     else if(actual.state==='apply_failed'||actual.state==='migration_attention_required')trackingState='apply_failed';
@@ -417,9 +444,9 @@ export class MeterService {
     return{registeredDevices:bindings.length,reportingDevices:reporting,status:bindings.length===0?'unknown':reporting===bindings.length?'full':reporting===0?'none':'partial'};
   }
   enrollmentStatus(enrollmentId) {
-    id(enrollmentId,'enrollmentId'); const row=this.database.prepare('SELECT id,expires_at,device_id FROM device_enrollments WHERE id=?').get(enrollmentId);
+    id(enrollmentId,'enrollmentId'); const row=this.database.prepare('SELECT e.id,e.expires_at,e.device_id,d.last_seen_at FROM device_enrollments e LEFT JOIN devices d ON d.id=e.device_id WHERE e.id=?').get(enrollmentId);
     if(!row)fail(404,'enrollment_not_found');
-    return {enrollmentId:row.id,expiresAt:row.expires_at,status:row.device_id?'connected':(row.expires_at<=nowIso(this.clock)?'expired':'pending'),deviceId:row.device_id??null};
+    return {enrollmentId:row.id,expiresAt:row.expires_at,status:row.device_id?(row.last_seen_at?'connected':'registered'):(row.expires_at<=nowIso(this.clock)?'expired':'pending'),deviceId:row.device_id??null};
   }
   deviceDetail(deviceId) {
     id(deviceId); const row = this.database.prepare(`SELECT d.*,g.name group_name FROM devices d LEFT JOIN groups g ON g.id=d.current_group_id WHERE d.id=? AND d.removed_at IS NULL`).get(deviceId);
@@ -453,6 +480,7 @@ export class MeterService {
     exact(body, ['agentVersion','codexVersion','events','health'],['quotaReport','quotaReports','configurationState']);
     const capabilities=parseCapabilities(capabilitiesValue),configurationState=parseConfigurationState(body.configurationState);
     if(configurationState&&!capabilities.actualState)fail(400,'configuration_capability_required');
+    if(configurationState?.profiles.some(profile=>profile.mode==='existing')&&!capabilities.existingHomeSelection)fail(426,'compatible_agent_required');
     if(configurationState&&configurationState.desiredRevision>device.desired_config_revision)fail(400,'invalid_configuration_revision');
     if(configurationState){
       const expected=configurationState.appliedRevision===0?[]:this.database.prepare(`SELECT binding_id,account_id,mode FROM device_configuration_revision_profiles
@@ -497,6 +525,7 @@ export class MeterService {
       }
       this.database.prepare(`UPDATE devices SET last_seen_at=?,agent_version=?,codex_version=?,health_status=?,agent_configuration_schema=?,declarative_profiles_supported=?,actual_state_supported=?,updated_at=? WHERE id=?`)
         .run(receivedAt,agentVersion,codexVersion,body.health.status,capabilities.agentConfigurationSchema,capabilities.declarativeProfiles?1:0,capabilities.actualState?1:0,receivedAt,device.id);
+      this.database.prepare('UPDATE devices SET existing_home_supported=? WHERE id=?').run(capabilities.existingHomeSelection?1:0,device.id);
       if(configurationState){
         this.database.prepare('UPDATE devices SET applied_config_revision=?,configuration_status=?,configuration_error_kind=?,configuration_reported_at=? WHERE id=?').run(configurationState.appliedRevision,configurationState.status,configurationState.errorKind,receivedAt,device.id);
         this.database.prepare('DELETE FROM device_profile_status WHERE device_id=?').run(device.id);
@@ -506,8 +535,8 @@ export class MeterService {
       if(quota)this.replaceQuota(device.id,quota);
       for(const report of profileQuotas)this.replaceAccountQuota(device.id,report.accountId,report.quota);
     });
-    return {acceptedEventIds:accepted,duplicateEventIds:duplicate,rejectedEvents:rejected,serverTime:receivedAt,agentConfiguration:capabilities.declarativeProfiles?this.desiredConfiguration(device.id):this.configuration(),
-      ...(capabilities.declarativeProfiles?{serverCapabilities:SERVER_CAPABILITIES}:{}),isQuotaReporter:reporter===device.id};
+    return {acceptedEventIds:accepted,duplicateEventIds:duplicate,rejectedEvents:rejected,serverTime:receivedAt,agentConfiguration:capabilities.declarativeProfiles?this.desiredConfiguration(device.id,capabilities.existingHomeSelection===true):this.configuration(),
+      ...(capabilities.declarativeProfiles?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}),isQuotaReporter:reporter===device.id};
   }
 
   replaceQuota(deviceId,quota){

@@ -1,0 +1,2 @@
+# Codex Meter synthetic system policy fixture; never a real configuration.
+chatgpt_base_url = "https://quota-system-policy.invalid"

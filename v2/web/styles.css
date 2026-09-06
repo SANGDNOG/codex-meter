@@ -87,8 +87,28 @@ body {
   color: #ffffff;
 }
 
-.logout {
+.sidebar-footer {
   margin-top: auto;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.sidebar-footer button {
+  width: 100%;
+}
+
+.language-toggle {
+  border-color: rgba(220, 236, 239, 0.45);
+}
+
+.login-panel {
+  width: min(400px, 100%);
+}
+
+.login-language {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.6rem;
 }
 
 .main {
@@ -502,7 +522,7 @@ textarea {
 }
 
 .login .card {
-  width: min(400px, 100%);
+  width: 100%;
 }
 
 .error {
@@ -631,10 +651,13 @@ dialog::backdrop {
     white-space: nowrap;
   }
 
-  .logout {
-    position: absolute;
-    top: 0.65rem;
-    right: 1rem;
+  .sidebar-footer {
+    margin-top: 0;
+    display: flex;
+  }
+
+  .sidebar-footer button {
+    width: auto;
   }
 
   .main {

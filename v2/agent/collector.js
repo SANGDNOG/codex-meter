@@ -4,6 +4,7 @@ import { discoverRollouts } from './discovery.js';
 import { readCompleteLines, safeBaseline } from './reader.js';
 import { createTelemetryParser } from '../shared/telemetry.js';
 import { parseUnsignedInt64 } from '../shared/int64.js';
+import { existingRootKey, readExistingRoot } from './existing-root.js';
 
 function now() { return new Date().toISOString(); }
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
@@ -13,6 +14,7 @@ function transaction(database, callback) {
   catch (error) { database.exec('ROLLBACK'); throw error; }
 }
 function object(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : null; }
+const fileRead = (file, callback) => file.withOpen ? file.withOpen(callback) : callback(file.path);
 
 /** Classify only explicit SessionMeta structure. Unknown/incomplete lineage is never treated as a root. */
 export function classifyRollout(records) {
@@ -54,22 +56,26 @@ function putCursor(database, descriptor, values) {
 }
 
 export class AgentCollector {
-  constructor(database, { home, accountId = null, bindingKey = accountId, discovery = discoverRollouts, clock = Date.now } = {}) {
+  constructor(database, { home, accountId = null, bindingKey = accountId, discovery = discoverRollouts, clock = Date.now, rootIdentity } = {}) {
     this.database = database; this.home = home; this.accountId = accountId; this.bindingKey = bindingKey; this.discovery = discovery; this.clock = clock;
+    this.rootIdentity = rootIdentity;
   }
 
   identity(value) { return this.bindingKey ? `${this.bindingKey}\0${value}` : value; }
   baselineKey() { return this.bindingKey ? `installation_baselined:${hash(this.bindingKey)}` : 'installation_baselined'; }
   reactivationKey() { return `reactivation_baseline:${hash(this.bindingKey ?? '')}`; }
 
-  async baselineCurrent() {
-    const discovery=await this.discovery({home:this.home}),baselines=[];
+  async baselineCurrent({withinTransaction=false}={}) {
+    const discovery=await this.discovery({home:this.home,rootIdentity:this.rootIdentity??readExistingRoot(this.database,this.bindingKey,this.home)??undefined}),baselines=[];
+    try {
     for(const file of discovery.files){
-      try{baselines.push([file,await safeBaseline(file.path)]);}catch(error){if(error.code!=='ENOENT')throw error;}
+      try{baselines.push([file,await fileRead(file,safeBaseline)]);}catch(error){if(discovery.validate||error.code!=='ENOENT')throw error;}
     }
-    transaction(this.database,()=>{
+    const commitBaseline=()=>{
       for(const [file,base] of baselines)putCursor(this.database,{...file,physicalIdentity:this.identity(file.physicalIdentity)},{...base,classification:'baseline'});
       const timestamp=new Date(this.clock()).toISOString();
+      if(discovery.rootIdentity)this.database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(existingRootKey(this.bindingKey),JSON.stringify(discovery.rootIdentity),timestamp);
       for(const file of discovery.compressedFiles??[]){
         const identity=this.identity(file.physicalIdentity);
         this.database.prepare('DELETE FROM rollout_cursors WHERE rollout_key=?').run(hash(identity));
@@ -80,20 +86,34 @@ export class AgentCollector {
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(this.baselineKey(),timestamp,timestamp);
       this.database.prepare(`INSERT INTO agent_state(key,value,updated_at) VALUES(?,?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(this.reactivationKey(),timestamp,timestamp);
-    });
+    };
+    await discovery.validate?.();
+    if(withinTransaction)commitBaseline();else transaction(this.database,commitBaseline);
     return{baseline:baselines.length,events:0,files:discovery.files.length,compressedOnly:discovery.compressedOnly};
+    } finally { await discovery.close?.(); }
   }
 
   async reconcile() {
-    const discovery = await this.discovery({ home: this.home });
+    const discovery = await this.discovery({ home: this.home, rootIdentity:readExistingRoot(this.database,this.bindingKey,this.home) });
+    const pending = [];
+    const commit = callback => discovery.validate ? pending.push(callback) : transaction(this.database,callback);
+    try {
+      const result = await this.reconcileDiscovery(discovery,commit);
+      await discovery.validate?.();
+      if(pending.length)transaction(this.database,()=>{for(const callback of pending)callback();});
+      return result;
+    } finally { await discovery.close?.(); }
+  }
+
+  async reconcileDiscovery(discovery, commit) {
     const baselineKey = this.baselineKey();
     const installed = this.database.prepare('SELECT value FROM agent_state WHERE key=?').get(baselineKey);
     if (!installed) {
       const baselines = [];
       for (const file of discovery.files) {
-        try { baselines.push([file, await safeBaseline(file.path)]); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        try { baselines.push([file, await fileRead(file,safeBaseline)]); } catch (error) { if (discovery.validate || error.code !== 'ENOENT') throw error; }
       }
-      transaction(this.database, () => {
+      commit(() => {
         if (!this.database.prepare('SELECT 1 FROM agent_state WHERE key=?').get(baselineKey)) {
           for (const [file, base] of baselines) putCursor(this.database, { ...file, physicalIdentity: this.identity(file.physicalIdentity) }, { ...base, classification: 'baseline' });
           const timestamp = new Date(this.clock()).toISOString();
@@ -105,44 +125,52 @@ export class AgentCollector {
       return { baseline: baselines.length, events: 0, files: discovery.files.length, compressedOnly: discovery.compressedOnly };
     }
     const compressedAt = new Date(this.clock()).toISOString();
-    for (const file of discovery.compressedFiles ?? []) this.database.prepare('INSERT OR IGNORE INTO agent_state(key,value,updated_at) VALUES(?,?,?)')
-      .run(`compressed_baseline:${hash(this.identity(file.physicalIdentity))}`, '1', compressedAt);
+    commit(()=>{for (const file of discovery.compressedFiles ?? []) this.database.prepare('INSERT OR IGNORE INTO agent_state(key,value,updated_at) VALUES(?,?,?)')
+      .run(`compressed_baseline:${hash(this.identity(file.physicalIdentity))}`, '1', compressedAt);});
     let events = 0;
-    for (const file of discovery.files) events += await this.collectFile(file);
+    for (const file of discovery.files) events += await this.collectFile(file,{commit});
     return { baseline: 0, events, files: discovery.files.length, compressedOnly: discovery.compressedOnly };
   }
 
-  async collectFile(descriptor) {
+  async collectFile(descriptor, {commit=callback=>transaction(this.database,callback)} = {}) {
+    if(!descriptor.withOpen)return this.collectOpenedFile(descriptor,descriptor.path,commit);
+    const pending=[];
+    const result=await fileRead(descriptor,source=>this.collectOpenedFile(descriptor,source,callback=>pending.push(callback)));
+    for(const callback of pending)commit(callback);
+    return result;
+  }
+
+  async collectOpenedFile(descriptor, source, commit) {
     const scopedDescriptor = { ...descriptor, physicalIdentity: this.identity(descriptor.physicalIdentity) };
     const rolloutKey = hash(scopedDescriptor.physicalIdentity);
     let current = cursor(this.database, rolloutKey);
     if (!current) {
       const compressedKey = `compressed_baseline:${hash(scopedDescriptor.physicalIdentity)}`;
       if (this.database.prepare('SELECT 1 FROM agent_state WHERE key=?').get(compressedKey)) {
-        const base = await safeBaseline(descriptor.path);
-        transaction(this.database, () => {
+        const base = await safeBaseline(source);
+        commit(() => {
           putCursor(this.database, scopedDescriptor, { ...base, classification: 'ambiguous' });
           this.database.prepare('DELETE FROM agent_state WHERE key=?').run(compressedKey);
         });
         return 0;
       }
-      const probe = await readCompleteLines(descriptor.path, 0, { maxReadBytes: 8 * 1024 * 1024, maxLines: 256 });
+      const probe = await readCompleteLines(source, 0, { maxReadBytes: 8 * 1024 * 1024, maxLines: 256 });
       const classification = classifyRollout(probe.lines.map(({ record }) => record));
       if (classification !== 'root') {
-        const base = await safeBaseline(descriptor.path);
-        transaction(this.database, () => putCursor(this.database, scopedDescriptor, { ...base, classification }));
+        const base = await safeBaseline(source);
+        commit(() => putCursor(this.database, scopedDescriptor, { ...base, classification }));
         return 0;
       }
       current = { byte_offset: 0, discard_until_newline: 0, classification, model: null, reasoning_effort: null };
     }
     let size;
-    try { size = (await stat(descriptor.path)).size; } catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
+    try { size = (await (typeof source === 'string' ? stat(source) : source.stat())).size; } catch (error) { if (!descriptor.withOpen && error.code === 'ENOENT') return 0; throw error; }
     if (BigInt(current.byte_offset) > BigInt(size)) {
-      const base = await safeBaseline(descriptor.path);
-      transaction(this.database, () => putCursor(this.database, scopedDescriptor, { ...base, classification: 'ambiguous' }));
+      const base = await safeBaseline(source);
+      commit(() => putCursor(this.database, scopedDescriptor, { ...base, classification: 'ambiguous' }));
       return 0;
     }
-    const parsed = await readCompleteLines(descriptor.path, Number(current.byte_offset), {
+    const parsed = await readCompleteLines(source, Number(current.byte_offset), {
       discardUntilNewline: Boolean(current.discard_until_newline), maxReadBytes: 8 * 1024 * 1024, maxLines: 10_000
     });
     if (parsed.disappeared) return 0;
@@ -156,7 +184,7 @@ export class AgentCollector {
       if (event && (notBefore===null||(Number.isFinite(notBefore)&&Number.isFinite(occurredAt)&&occurredAt>=notBefore))) additions.push({ event, id: hash(`${scopedDescriptor.physicalIdentity}\0${line.start}\0${line.end}\0${JSON.stringify(event)}`) });
     }
     const finalContext = parser.context();
-    transaction(this.database, () => {
+    commit(() => {
       // Recheck prevents two watcher/reconcile passes from duplicating work.
       const latest = cursor(this.database, rolloutKey);
       const expected = BigInt(current.byte_offset);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { openAgentDatabase } from '../v2/agent/database.js';
@@ -172,4 +172,31 @@ test('M3 saveConfig rejects insecure remote HTTP and unknown fields', async () =
   const target = path.join(f.directory, 'agent.json');
   await assert.rejects(saveConfig(target, { ...config(), serverUrl: 'http://example.com' }), /HTTPS/);
   await assert.rejects(saveConfig(target, { ...config(), surprise: 'secret' }), /unknown/);
+}));
+
+test('Re-enrollment isolates old device state and retains its config, home and database',async()=>fixture(async f=>{
+  const configPath=path.join(f.directory,'agent.json');
+  await saveConfig(configPath,{...config(),serverUrl:'https://meter.example',codexHome:f.home,databasePath:f.dbPath});
+  f.database.prepare("UPDATE agent_state SET value='3' WHERE key IN ('desired_config_revision','applied_config_revision')").run();
+  const authPath=path.join(f.home,'auth.json');await writeFile(authPath,'login sentinel');
+  let sequence=0;
+  const server=createServer((_request,response)=>{response.writeHead(201,{'content-type':'application/json'});response.end(JSON.stringify({deviceId:`new-device-${++sequence}`,deviceSecret:'s'.repeat(32),agentConfiguration:{syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100}}));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const enrollment=await enroll({serverUrl:`http://127.0.0.1:${server.address().port}`,token:'test',configPath,allowHttpForTests:true,databasePath:f.dbPath});
+    assert.equal(enrollment.config.codexHome,f.home);assert.notEqual(enrollment.config.databasePath,f.dbPath);
+    const fresh=openAgentDatabase(enrollment.config.databasePath);try{assert.equal(fresh.prepare("SELECT value FROM agent_state WHERE key='desired_config_revision'").get().value,'0');}finally{fresh.close();}
+    assert.equal(f.database.prepare("SELECT value FROM agent_state WHERE key='desired_config_revision'").get().value,'3');assert.equal(await readFile(authPath,'utf8'),'login sentinel');
+    const backups=(await readdir(f.directory)).filter(name=>name.startsWith('agent.json.before-enroll-'));assert.equal(backups.length,1);const old=JSON.parse(await readFile(path.join(f.directory,backups[0]),'utf8'));assert.equal(old.databasePath,f.dbPath);assert.equal((await stat(path.join(f.directory,backups[0]))).mode&0o777,0o600);
+    const second=await enroll({serverUrl:`http://127.0.0.1:${server.address().port}`,token:'test',configPath,allowHttpForTests:true});assert.notEqual(second.config.databasePath,enrollment.config.databasePath);assert.equal(second.config.codexHome,f.home);
+  }finally{await new Promise(resolve=>server.close(resolve));}
+}));
+
+test('Sync diagnostics retain safe server rejection codes and clear them after recovery',async()=>fixture(async f=>{
+  let responseCode=400;
+  const client=new AgentSyncClient(f.database,config(),{fetchImpl:async()=>new Response(JSON.stringify(responseCode===400?{error:'invalid_configuration_revision',detail:'secret must not be logged'}:{acceptedEventIds:[],duplicateEventIds:[],isQuotaReporter:false}),{status:responseCode,headers:{'content-type':'application/json'}})});
+  await assert.rejects(client.sync({heartbeat:true,collectQuota:false}),/400/);
+  assert.equal(f.database.prepare("SELECT value FROM agent_state WHERE key='last_sync_error_kind'").get().value,'invalid_configuration_revision');
+  assert.ok(f.database.prepare("SELECT value FROM agent_state WHERE key='last_sync_attempt_at'").get().value);
+  responseCode=200;await client.sync({heartbeat:true,collectQuota:false});assert.equal(f.database.prepare("SELECT value FROM agent_state WHERE key='last_sync_error_kind'").get().value,'');
 }));

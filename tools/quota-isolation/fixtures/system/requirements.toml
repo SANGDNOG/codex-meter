@@ -1,0 +1,2 @@
+# Codex Meter synthetic requirements fixture.
+cli_auth_credentials_store = "file"

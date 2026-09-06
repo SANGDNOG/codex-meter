@@ -23,4 +23,4 @@ export async function canonicalHome(value,{platform=process.platform,seen=new Se
   return platform==='win32'?current.toLowerCase():current;
 }
 
-export function homesOverlap(left,right){return left===right||left.startsWith(`${right}${path.sep}`)||right.startsWith(`${left}${path.sep}`);}
+export function homesOverlap(left,right){const contains=(a,b)=>{const relative=path.relative(a,b);return relative===''||(!path.isAbsolute(relative)&&relative!=='..'&&!relative.startsWith(`..${path.sep}`));};return contains(left,right)||contains(right,left);}

@@ -7,6 +7,8 @@ import { Window } from 'happy-dom';
 import { openAgentDatabase } from '../v2/agent/database.js';
 import { AgentRuntime } from '../v2/agent/runtime.js';
 import { AgentSyncClient } from '../v2/agent/sync.js';
+import { runAgentCli } from '../v2/agent/cli.js';
+import { loadConfig } from '../v2/agent/config.js';
 import { openServerDatabase } from '../v2/server/database.js';
 import { createV2Server } from '../v2/server/http.js';
 import { MeterService } from '../v2/server/service.js';
@@ -28,6 +30,48 @@ function event(eventId,occurredAt,accountId,totalTokens='1'){
 function syncBody(events=[]){return{agentVersion:'2.1-test',codexVersion:null,events,health:{status:'healthy'}};}
 function desired(revision,profiles){return{schemaVersion:1,revision,syncIntervalSeconds:15,heartbeatIntervalSeconds:60,maxBatchSize:100,profiles};}
 function rolloutUsage(tokens,minute){return`${JSON.stringify({timestamp:`2026-09-04T12:${String(minute).padStart(2,'0')}:00Z`,type:'event_msg',payload:{type:'token_count',info:{last_token_usage:{total_tokens:tokens,input_tokens:tokens,output_tokens:0,cached_input_tokens:0,reasoning_output_tokens:0}}}})}\n`;}
+
+test('Existing E2E: Web Add Device → new token bootstrap → local CLI selection → Home A usage only → Server restart',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'codex-meter-existing-e2e-')),serverFile=path.join(root,'server.db');
+  let database=openServerDatabase(serverFile);const now=Date.now();
+  const server=createV2Server({database,adminPassword:PASSWORD,clock:()=>now+120000});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const base=`http://127.0.0.1:${server.address().port}`,networkFetch=globalThis.fetch;
+  let cookie,token,deviceId;const wire=[];
+  const bridge=async(input,init={})=>{const url=new URL(String(input),base);const response=await networkFetch(`${base}${url.pathname}${url.search}`,{...init,headers:{...init.headers,origin:base.replace('http:','https:'),'x-forwarded-proto':'https',...(cookie?{cookie}:{})}});
+    if(url.pathname.startsWith('/api/v1/agent/'))wire.push({request:init.body,response:await response.clone().json()});
+    if(url.pathname==='/api/v1/devices'&&init.method==='POST'){const result=await response.clone().json();token=result.enrollmentToken;}
+    return response;};
+  const homes=['cx1','cx2'].map(name=>path.join(root,'home','test','.codex-profiles',name)),files=[];
+  const usage=tokens=>`${JSON.stringify({timestamp:new Date(now+180000).toISOString(),type:'event_msg',payload:{type:'token_count',info:{last_token_usage:{input_tokens:tokens,total_tokens:tokens}}}})}\n`;
+  for(const[index,home]of homes.entries()){await mkdir(path.join(home,'sessions'),{recursive:true});const id=`11111111-1111-4111-8111-11111111111${index}`,file=path.join(home,'sessions',`rollout-${id}.jsonl`);files.push(file);await writeFile(file,`${JSON.stringify({type:'session_meta',payload:{id}})}\n${usage(100)}`);await writeFile(path.join(home,'config.toml'),'preserve = true');await writeFile(path.join(home,'auth.json'),'do not inspect');}
+  let agentDatabase,runtime;
+  try{
+    const login=await bridge('/api/v1/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:PASSWORD})});cookie=login.headers.get('set-cookie').split(';')[0];const csrf=(await login.json()).csrfToken;
+    const accountResponse=await bridge('/api/v1/accounts',{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify({name:'Personal'})}),account=await accountResponse.json();
+    await domFixture({url:`${base}/#/devices/add`,fetchImpl:bridge},async({document,window,settle})=>{
+      for(let i=0;i<100&&!document.querySelector('[data-testid="initial-account"]');i++){await new Promise(resolve=>setImmediate(resolve));await settle();}
+      assert.equal(document.querySelectorAll('.choice-group input').length,3);
+      document.querySelector('[data-testid="device-name"]').value='WSL Linux x64';document.querySelector('[data-testid="initial-account"]').value=account.id;document.querySelector('[data-testid="initial-environment-existing"]').click();
+      document.querySelector('[data-testid="add-device-form"]').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+      for(let i=0;i<100&&!document.querySelector('[data-testid="command-linux"]');i++){await new Promise(resolve=>setImmediate(resolve));await settle();}
+      const command=document.querySelector('[data-testid="command-linux"]').textContent;assert.ok(command.includes(token));assert.equal(command.includes('CODEX_HOME'),false);
+      const configFile=path.join(root,'agent.json'),output={write(){}};
+      await runAgentCli(['enroll','--server',base,'--token',token,'--config',configFile,'--allow-http-for-tests'],{stdout:output});
+      const config=await loadConfig(configFile);deviceId=config.deviceId;agentDatabase=openAgentDatabase(config.databasePath);
+      runtime=new AgentRuntime(agentDatabase,config,{fetchImpl:bridge,watchImpl:()=>({close(){}}),quotaReporterFactory:entry=>({accountId:entry.accountId,async observe(){return{accountId:entry.accountId,status:'unavailable',errorKind:'not_authenticated',planType:null,observedAt:new Date(now+120000).toISOString(),windows:[]};}})});
+      await runtime.start();assert.equal(runtime.collectors.length,0);
+      await runAgentCli(['profile','attach-existing','--config',configFile,'--codex-home',homes[0]],{stdout:output});
+      await appendFile(files[0],usage(25));await runtime.reconcile();await runtime.sync(true);
+      assert.deepEqual(database.prepare('SELECT account_id,total_tokens FROM usage_events').all().map(row=>[row.account_id,row.total_tokens]),[[account.id,25]]);
+      await appendFile(files[1],usage(999));await runtime.reconcile();await runtime.sync(true);assert.equal(database.prepare('SELECT SUM(total_tokens) n FROM usage_events').get().n,25);
+      assert.deepEqual(runtime.collectors.map(c=>c.home),[homes[0]]);
+      for(const home of homes){assert.equal(await readFile(path.join(home,'config.toml'),'utf8'),'preserve = true');assert.equal(await readFile(path.join(home,'auth.json'),'utf8'),'do not inspect');}
+      for(const forbidden of [...homes,'cx1','cx2','localHome','canonical_home'])assert.equal(JSON.stringify(wire).includes(forbidden),false,forbidden);
+    });
+    await runtime.stop();runtime=null;await new Promise(resolve=>server.close(resolve));database.close();database=openServerDatabase(serverFile);
+    const service=new MeterService(database,{adminPassword:PASSWORD,clock:()=>now+240000});assert.equal(service.deviceDetail(deviceId).profiles[0].measured.totalTokens,'25');
+  }finally{await runtime?.stop();agentDatabase?.close();if(server.listening)await new Promise(resolve=>server.close(resolve));database.close();await rm(root,{recursive:true,force:true});}
+});
 
 test('V2.1 onboarding state model and stop/re-add preserve temporal binding periods',()=>tempDatabases(async({serverDatabase})=>{
   let now=NOW;const service=new MeterService(serverDatabase,{adminPassword:PASSWORD,clock:()=>now}),enrollment=service.createDevice({name:'Laptop'}),credentials=service.enroll({token:enrollment.enrollmentToken},SERVER_CAPABILITIES),personal=service.createAccount({name:'Personal'}),binding=service.bindAccount(credentials.deviceId,{accountId:personal.id,mode:'default'});
@@ -83,6 +127,75 @@ async function httpFixture(run){
   try{await run({root,database,server,base,request});}finally{await new Promise(resolve=>server.close(resolve));database.close();await rm(root,{recursive:true,force:true});}
 }
 
+test('V2.1 HTTP Profile and Device deletion preserve history and revoke active configuration safely',()=>httpFixture(async({database,request})=>{
+  const login=await request('/api/v1/auth/login',{method:'POST',body:{password:PASSWORD}}),auth={cookie:login.cookie,csrf:login.value.csrfToken},admin=(route,options={})=>request(route,{...options,...auth});
+  const account=(await admin('/api/v1/accounts',{method:'POST',body:{name:'Research'}})).value,pending=(await admin('/api/v1/devices',{method:'POST',body:{name:'Laptop',groupId:null,accountId:account.id,mode:'default'}})).value;
+  const enrolled=await request('/api/v1/agent/enroll',{method:'POST',body:{token:pending.enrollmentToken},headers:{[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE}}),authorization=`Bearer ${enrolled.value.deviceId}.${enrolled.value.deviceSecret}`,agentHeaders={authorization,[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE};
+  const synced=await request('/api/v1/agent/sync',{method:'POST',body:syncBody([event('retained',new Date(NOW).toISOString(),account.id,'25')]),headers:agentHeaders});assert.equal(synced.response.status,200);assert.deepEqual(synced.value.acceptedEventIds,['retained']);
+  const before=(await admin(`/api/v1/devices/${enrolled.value.deviceId}`)).value,deleted=await admin(`/api/v1/accounts/${account.id}`,{method:'DELETE',body:{}});assert.equal(deleted.response.status,200);assert.ok(deleted.value.archivedAt);
+  const after=(await admin(`/api/v1/devices/${enrolled.value.deviceId}`)).value;assert.equal(after.desiredRevision,before.desiredRevision+1);assert.deepEqual(database.prepare('SELECT account_id FROM device_configuration_revision_profiles WHERE device_id=? AND revision=?').all(enrolled.value.deviceId,after.desiredRevision),[]);
+  const historical=(await admin(`/api/v1/accounts/${account.id}?range=all`)).value;assert.equal(historical.measured.totalTokens,'25');assert.equal(database.prepare('SELECT COUNT(*) count FROM usage_events WHERE event_id=?').get('retained').count,1);
+  const removed=await admin(`/api/v1/devices/${enrolled.value.deviceId}`,{method:'DELETE',body:{}});assert.deepEqual({status:removed.response.status,value:removed.value},{status:200,value:{removed:true}});assert.equal((await request('/api/v1/agent/sync',{method:'POST',body:syncBody(),headers:agentHeaders})).response.status,401);assert.equal(database.prepare('SELECT COUNT(*) count FROM usage_events WHERE event_id=?').get('retained').count,1);assert.deepEqual((await admin('/api/v1/devices')).value.devices,[]);
+  const accountAfterRemoval=await admin(`/api/v1/accounts/${account.id}?range=all`);
+  assert.equal(accountAfterRemoval.response.status,200);assert.deepEqual(accountAfterRemoval.value.devices,[]);
+  assert.equal(accountAfterRemoval.value.measured.totalTokens,'25');
+  assert.equal((await admin('/api/v1/accounts')).value.accounts.find(row=>row.id===account.id).devices,0);
+}));
+
+test('Removed laptops disappear from account device rows and counts while history and remaining devices survive restart',()=>tempDatabases(async({root,serverDatabase})=>{
+  const service=new MeterService(serverDatabase,{adminPassword:PASSWORD,clock:()=>NOW});
+  const account=service.createAccount({name:'Personal'}),group=service.createGroup({name:'Laptops'});
+  const enroll=name=>service.enroll({token:service.createDevice({name,groupId:group.id,accountId:account.id,mode:'default'}).enrollmentToken},SERVER_CAPABILITIES);
+  const removed=enroll('Old laptop'),remaining=enroll('Current laptop');
+  service.sync(service.authenticateDevice(removed.deviceId,removed.deviceSecret),syncBody([event('old-laptop-history',new Date(NOW).toISOString(),account.id,'25')]));
+  service.sync(service.authenticateDevice(remaining.deviceId,remaining.deviceSecret),syncBody([event('current-laptop-history',new Date(NOW).toISOString(),account.id,'7')]));
+  const history=serverDatabase.prepare('SELECT * FROM usage_events ORDER BY event_id').all();
+  const bindings=serverDatabase.prepare('SELECT * FROM device_account_bindings ORDER BY id').all();
+  service.removeDevice(removed.deviceId);
+  const verify=current=>{
+    const detail=current.accountDetail(account.id),listed=current.listAccounts().find(row=>row.id===account.id);
+    assert.deepEqual(detail.devices.map(row=>row.deviceId),[remaining.deviceId]);
+    assert.equal(listed.devices,1);assert.equal(detail.trackingCoverage.registeredDevices,1);
+    assert.equal(detail.measured.totalTokens,'32');assert.equal(detail.groups.find(row=>row.id===group.id).measured.totalTokens,'32');
+    assert.equal(detail.devices[0].measured.totalTokens,'7');
+    for(const device of detail.devices)assert.equal(current.deviceDetail(device.deviceId).id,device.deviceId);
+    assert.equal(current.authenticateDevice(removed.deviceId,removed.deviceSecret),null);
+    assert.throws(()=>current.deviceDetail(removed.deviceId),error=>error.code==='device_not_found');
+  };
+  verify(service);
+  const reopened=openServerDatabase(path.join(root,'server.db'));
+  try{
+    const restarted=new MeterService(reopened,{clock:()=>NOW});verify(restarted);
+    assert.deepEqual(reopened.prepare('SELECT * FROM usage_events ORDER BY event_id').all(),history);
+    assert.deepEqual(reopened.prepare('SELECT * FROM device_account_bindings ORDER BY id').all(),bindings);
+    // A stopped binding remains visible on a real device, but is not counted as active.
+    restarted.disableBinding(remaining.deviceId,restarted.accountDetail(account.id).devices[0].id);
+    assert.equal(restarted.accountDetail(account.id).devices.length,1);
+    assert.equal(restarted.listAccounts().find(row=>row.id===account.id).devices,0);
+    restarted.removeDevice(remaining.deviceId);
+    assert.deepEqual(restarted.accountDetail(account.id).devices,[]);
+    assert.equal(restarted.accountDetail(account.id).measured.totalTokens,'32');
+  }finally{reopened.close();}
+}));
+
+test('Archiving a default Account stops bindings, releases the slot and preserves history without implicit reactivation',()=>tempDatabases(async({serverDatabase})=>{
+  let now=NOW;const service=new MeterService(serverDatabase,{adminPassword:PASSWORD,clock:()=>now}),account=service.createAccount({name:'Old profile'});
+  const credentials=service.enroll({token:service.createDevice({name:'Laptop',accountId:account.id,mode:'default'}).enrollmentToken},SERVER_CAPABILITIES);
+  service.sync(service.authenticateDevice(credentials.deviceId,credentials.deviceSecret),syncBody([event('archive-history',new Date(NOW).toISOString(),account.id,'25')]));
+  const before=service.deviceDetail(credentials.deviceId),binding=before.profiles[0];now+=1000;
+  service.updateAccount(account.id,{archived:true});const stopped=service.desiredConfiguration(credentials.deviceId);
+  assert.deepEqual(stopped.profiles,[]);assert.equal(stopped.revision,before.desiredRevision+1);
+  assert.equal(service.accountDetail(account.id).trackingCoverage.registeredDevices,0);
+  assert.equal(service.listAccounts().find(row=>row.id===account.id).devices,0);
+  assert.equal(serverDatabase.prepare('SELECT valid_until FROM device_account_binding_periods WHERE binding_id=?').get(binding.id).valid_until,new Date(now).toISOString());
+  service.sync(service.authenticateDevice(credentials.deviceId,credentials.deviceSecret),{...syncBody(),configurationState:{desiredRevision:stopped.revision,appliedRevision:stopped.revision,status:'healthy',errorKind:null,profiles:[]}},SERVER_CAPABILITIES);
+  assert.equal(service.deviceDetail(credentials.deviceId).profiles[0].trackingState,'stopped');
+  const replacement=service.createAccount({name:'Replacement'});service.bindAccount(credentials.deviceId,{accountId:replacement.id,mode:'default'});
+  service.updateAccount(account.id,{archived:false});
+  assert.deepEqual(service.desiredConfiguration(credentials.deviceId).profiles.map(row=>row.accountId),[replacement.id]);
+  assert.equal(service.accountDetail(account.id).measured.totalTokens,'25');
+}));
+
 test('V2.1 Web/API add account hot-applies through a live Agent sync and reports login required',()=>httpFixture(async({root,request,base})=>{
   const login=await request('/api/v1/auth/login',{method:'POST',body:{password:PASSWORD}}),auth={cookie:login.cookie,csrf:login.value.csrfToken},admin=(route,options={})=>request(route,{...options,...auth});
   const personal=(await admin('/api/v1/accounts',{method:'POST',body:{name:'Personal'}})).value,research=(await admin('/api/v1/accounts',{method:'POST',body:{name:'Research'}})).value;
@@ -110,17 +223,52 @@ function emptyUsage(){return{measured:{...ZERO},adjusted:{totalTokens:'0'},combi
 function unavailableQuota(){return{observedAt:null,status:'unavailable',reporterState:'no_reporter',reporterDeviceId:null,errorKind:null,planType:null,windows:[]};}
 function emptyAttribution(accountId){return{accountId,quota:unavailableQuota(),windows:[],warnings:[]};}
 
-async function domFixture({url='https://meter.example/#/overview',fetchImpl},run){
+async function domFixture({url='https://meter.example/#/overview',fetchImpl,pollTimers=null},run){
   const window=new Window({url}),document=window.document;document.body.innerHTML='<a class="skip" href="#main">Skip</a><div id="app"></div><div id="toast" hidden></div>';
   if(typeof window.HTMLDialogElement.prototype.showModal!=='function')window.HTMLDialogElement.prototype.showModal=function(){this.open=true;};
   const originalDescriptors=new Map(),keys=['window','document','Node','location','navigator','fetch','confirm','setTimeout','clearTimeout'],timers=new Set(),realSetTimeout=globalThis.setTimeout,realClearTimeout=globalThis.clearTimeout;
   const install=(key,value)=>{originalDescriptors.set(key,Object.getOwnPropertyDescriptor(globalThis,key));Object.defineProperty(globalThis,key,{configurable:true,writable:true,value});};
   install('window',window);install('document',document);install('Node',window.Node);install('location',window.location);install('navigator',window.navigator);install('fetch',fetchImpl);install('confirm',()=>true);
-  install('setTimeout',(callback,delay,...args)=>{const timer=realSetTimeout(callback,delay,...args);timer.unref?.();timers.add(timer);return timer;});install('clearTimeout',timer=>{timers.delete(timer);realClearTimeout(timer);});
+  install('setTimeout',(callback,delay,...args)=>{if(pollTimers&&delay===3000){const timer=Symbol('poll');pollTimers.set(timer,callback);return timer;}const timer=realSetTimeout(callback,delay,...args);timer.unref?.();timers.add(timer);return timer;});install('clearTimeout',timer=>{if(pollTimers?.delete(timer))return;timers.delete(timer);realClearTimeout(timer);});
   const settle=async()=>{for(let index=0;index<6;index++)await new Promise(resolve=>setImmediate(resolve));};
   try{await import(`../v2/web/app.js?dom=${Date.now()}-${Math.random()}`);await settle();await run({window,document,settle});}
   finally{for(const timer of timers)realClearTimeout(timer);window.close();for(const key of keys){const descriptor=originalDescriptors.get(key);if(descriptor)Object.defineProperty(globalThis,key,descriptor);else delete globalThis[key];}}
 }
+
+test('Device polling preserves the page and drafts, retries errors, and ignores responses after navigation',async()=>{
+  const pollTimers=new Map();let pendingResponse=null,failPoll=false;
+  let device={id:'laptop',name:'Laptop',state:'offline',currentGroupId:null,currentGroupName:null,lastSeenAt:null,configurationStatus:'unknown',profiles:[{id:'binding',accountId:'personal',name:'Personal',mode:'default',trackingState:'waiting_for_agent',measured:{...ZERO}}]};
+  const fetchImpl=async input=>{const path=new URL(String(input),'https://meter.example').pathname;
+    if(path==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(path==='/api/v1/devices/laptop'){if(pendingResponse)return pendingResponse;if(failPoll)return jsonResponse(503,{error:'unavailable'});return jsonResponse(200,device);}
+    if(path==='/api/v1/usage/devices/laptop')return jsonResponse(200,emptyUsage());
+    if(path==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(path==='/api/v1/accounts')return jsonResponse(200,{accounts:[]});
+    if(path==='/api/v1/devices')return jsonResponse(200,{devices:[]});
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/devices/laptop',fetchImpl,pollTimers},async({document,window,settle})=>{
+    const main=document.querySelector('main'),shell=document.querySelector('.shell'),name=document.querySelector('.compact-form input'),row=document.querySelector('.profile-row');
+    name.value='Unsaved laptop name';name.focus();
+    const tick=async()=>{assert.equal(pollTimers.size,1);const[key,callback]=pollTimers.entries().next().value;pollTimers.delete(key);await callback();await settle();};
+    await tick();assert.equal(document.querySelector('.profile-row'),row);
+    assert.equal(document.querySelector('main'),main);assert.equal(document.querySelector('.shell'),shell);assert.equal(document.activeElement,name);assert.equal(name.value,'Unsaved laptop name');
+    failPoll=true;await tick();assert.equal(document.querySelector('main'),main);assert.equal(name.value,'Unsaved laptop name');failPoll=false;
+    device={...device,state:'online',lastSeenAt:'2026-09-05T07:00:00.000Z',profiles:device.profiles.map(profile=>({...profile,trackingState:'login_required'}))};
+    await tick();assert.match(main.textContent,/Login required/);assert.equal(document.querySelector('main'),main);assert.equal(document.activeElement,name);assert.equal(name.value,'Unsaved laptop name');assert.equal(pollTimers.size,1);
+    device={...device,state:'offline',profiles:device.profiles.map(profile=>({...profile,trackingState:'agent_offline'}))};
+    await tick();assert.match(main.textContent,/Agent offline/);assert.equal(document.querySelector('.profile-row'),row);assert.equal(document.activeElement,name);
+    await tick();assert.equal(document.querySelector('.profile-row'),row);assert.equal(document.querySelector('main'),main);
+    device={...device,state:'online',profiles:device.profiles.map(profile=>({...profile,trackingState:'tracking'}))};
+    await tick();assert.match(main.textContent,/Tracking/);assert.equal(document.querySelector('.profile-row'),row);assert.equal(pollTimers.size,1);
+    // Re-enter the pending page, then leave while its background response is in flight.
+    device.profiles[0].trackingState='applying';window.dispatchEvent(new window.HashChangeEvent('hashchange'));await settle();
+    let resolveResponse;pendingResponse=new Promise(resolve=>{resolveResponse=resolve;});
+    const[key,callback]=pollTimers.entries().next().value;pollTimers.delete(key);const inFlight=callback();
+    window.location.hash='#/devices';window.dispatchEvent(new window.HashChangeEvent('hashchange'));await settle();const deviceList=document.querySelector('main');
+    resolveResponse(jsonResponse(200,device));await inFlight;await settle();assert.equal(document.querySelector('main'),deviceList);assert.match(deviceList.textContent,/No connected devices yet/);assert.equal(pollTimers.size,0);
+  });
+});
 
 test('V2.1 DOM flow signs in, creates a current-login Device, and renders safe enrollment commands',async()=>{
   let authenticated=false,createdBody=null;const account={id:'personal',name:"Personal '; rm -rf",archivedAt:null,reference:false,devices:0,measured:{...ZERO},quota:unavailableQuota(),trackingCoverage:{registeredDevices:0,reportingDevices:0,status:'unknown'}};
@@ -172,6 +320,50 @@ test('V2.1 DOM Accounts flow creates a new Account Profile from the New profile 
     const create=document.querySelector('[data-testid="new-profile"]');assert.ok(create);assert.equal(create.disabled,false);create.click();
     const dialog=document.querySelector('[data-testid="account-profile-dialog"]');assert.ok(dialog);document.querySelector('[data-testid="profile-name"]').value='Research <script>';
     document.querySelector('[data-testid="save-profile"]').click();await settle();assert.deepEqual(createdBody,{name:'Research <script>',reference:false});assert.equal(document.querySelector('[data-testid="account-profile-dialog"]'),null);assert.match(document.querySelector('main').textContent,/Research <script>/);assert.equal(document.querySelector('main script'),null);
+  });
+});
+
+test('V2.1 DOM language toggle switches English and Korean, persists the choice, and preserves user labels',async()=>{
+  const account={id:'devices',name:'Devices <script>',archivedAt:null,reference:false,devices:0,measured:{...ZERO},quota:unavailableQuota(),trackingCoverage:{registeredDevices:0,reportingDevices:0,status:'unknown'}};
+  const fetchImpl=async(input)=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route.startsWith('/api/v1/accounts?range='))return jsonResponse(200,{accounts:[account]});
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/accounts',fetchImpl},async({document,window,settle})=>{
+    assert.equal(document.documentElement.lang,'en');assert.match(document.querySelector('main').textContent,/Account Profiles and tracking coverage/);assert.match(document.querySelector('main').textContent,/Devices <script>/);
+    document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.equal(document.documentElement.lang,'ko');assert.match(document.cookie,/codex_meter_language=ko/);assert.match(document.querySelector('main').textContent,/계정 프로필과 추적 범위/);assert.match(document.querySelector('main').textContent,/Devices <script>/);assert.equal(document.querySelector('main script'),null);
+    document.querySelector('[data-testid="delete-account-devices"]').click();assert.match(document.querySelector('[data-testid="delete-account-dialog"]').textContent,/과거 사용 기록과 로컬 Codex 로그인 데이터는 유지됩니다/);document.querySelector('[data-testid="delete-account-dialog"] button:not(.danger)').click();
+    document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.equal(document.documentElement.lang,'en');assert.match(document.cookie,/codex_meter_language=en/);assert.match(document.querySelector('main').textContent,/Account Profiles and tracking coverage/);
+  });
+});
+
+test('V2.1 DOM Accounts flow deletes a Profile while explaining history and local data retention',async()=>{
+  const profile=(archivedAt=null)=>({id:'research',name:'Research <script>',archivedAt,reference:false,devices:1,measured:{...ZERO,totalTokens:'25'},quota:unavailableQuota(),trackingCoverage:{registeredDevices:1,reportingDevices:1,status:'full'}});let accounts=[profile()],deleteCount=0;
+  const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route.startsWith('/api/v1/accounts?range='))return jsonResponse(200,{accounts});
+    if(route==='/api/v1/accounts/research'&&method==='DELETE'){deleteCount+=1;accounts=[profile('2026-09-04T12:00:00.000Z')];return jsonResponse(200,accounts[0]);}
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/accounts',fetchImpl},async({document,settle})=>{
+    assert.ok(document.querySelector('[data-testid="account-research"]'));document.querySelector('[data-testid="delete-account-research"]').click();
+    const dialog=document.querySelector('[data-testid="delete-account-dialog"]');assert.ok(dialog);assert.match(dialog.textContent,/stop tracking this Profile on every Device/);assert.match(dialog.textContent,/Historical usage and local Codex login data remain/);assert.equal(dialog.querySelector('script'),null);
+    document.querySelector('[data-testid="confirm-delete-account-dialog"]').click();await settle();assert.equal(deleteCount,1);assert.equal(document.querySelector('[data-testid="account-research"]'),null);assert.match(document.querySelector('main').textContent,/No Account Profiles yet/);
+  });
+});
+
+test('V2.1 DOM Devices flow removes a Device from the list with an explicit retention warning',async()=>{
+  const laptop={id:'device-1',name:'Laptop <script>',currentGroupName:'Development',state:'online',lastSeenAt:'2026-09-04T12:00:00.000Z'};let devicesList=[laptop],deleteCount=0;
+  const fetchImpl=async(input,options={})=>{const target=new URL(String(input),'https://meter.example'),route=target.pathname+target.search,method=options.method??'GET';
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});
+    if(route==='/api/v1/devices'&&method==='GET')return jsonResponse(200,{devices:devicesList});
+    if(route==='/api/v1/devices/device-1'&&method==='DELETE'){deleteCount+=1;devicesList=[];return jsonResponse(200,{removed:true});}
+    return jsonResponse(404,{error:'not_found'});
+  };
+  await domFixture({url:'https://meter.example/#/devices',fetchImpl},async({document,settle})=>{
+    document.querySelector('[data-testid="remove-device-device-1"]').click();const dialog=document.querySelector('[data-testid="remove-device-dialog"]');assert.ok(dialog);assert.match(dialog.textContent,/revoke this Device credential/);assert.match(dialog.textContent,/local Agent and Codex data are not deleted/);assert.equal(dialog.querySelector('script'),null);
+    document.querySelector('[data-testid="confirm-remove-device-dialog"]').click();await settle();assert.equal(deleteCount,1);assert.match(document.querySelector('main').textContent,/No connected devices yet/);
   });
 });
 
@@ -248,6 +440,36 @@ test('V2.1 DOM Account detail shows registered-device coverage and estimated quo
   const fetchImpl=async input=>{const route=new URL(String(input),'https://meter.example').pathname+new URL(String(input),'https://meter.example').search;if(route==='/api/v1/auth/session')return jsonResponse(200,{authenticated:true,csrfToken:'csrf'});if(route==='/api/v1/accounts/personal?range=today')return jsonResponse(200,account);if(route==='/api/v1/accounts/personal/quota-attribution')return jsonResponse(200,attribution);return jsonResponse(404,{error:'not_found'});};
   await domFixture({url:'https://meter.example/#/accounts/personal',fetchImpl},async({document})=>{
     const text=document.querySelector('main').textContent;assert.match(text,/2 \/ 3 registered devices reporting - estimate may be incomplete/);assert.match(text,/42% used/);assert.match(text,/Estimated quota contribution since tracking began/);assert.match(text,/~12.0%p/);assert.match(text,/Existing Codex login/);assert.match(text,/Agent offline/);
+  });
+});
+
+test('Existing Web statuses and Korean option explain local selection and original launcher without UUIDs or XSS',async()=>{
+  const pollTimers=new Map(),profile={id:'hidden-binding',accountId:'personal',name:'<img src=x onerror=alert(1)>',mode:'existing',trackingState:'local_selection_required',measured:{...ZERO},actual:{state:'local_selection_required'}};
+  const fetchImpl=async input=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/devices/laptop')return jsonResponse(200,{id:'laptop',name:'Laptop',profiles:[profile],state:'online'});
+    if(route==='/api/v1/usage/devices/laptop')return jsonResponse(200,emptyUsage());
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts')return jsonResponse(200,{accounts:[]});return jsonResponse(404,{});};
+  await domFixture({url:'https://meter.example/#/devices/laptop',fetchImpl,pollTimers},async({document,settle})=>{
+    let row=document.querySelector('.profile-row');assert.match(row.textContent,/Waiting for local environment selection/);assert.match(row.textContent,/codex-meter-agent profile attach-existing/);assert.doesNotMatch(row.textContent,/hidden-binding/);assert.equal(row.querySelector('img'),null);
+    profile.trackingState='login_required';profile.actual.state='login_required';const[key,callback]=pollTimers.entries().next().value;pollTimers.delete(key);await callback();await settle();
+    row=document.querySelector('.profile-row');assert.match(row.textContent,/Use your existing Codex launcher to sign in/);assert.equal(row.querySelector('.login-command'),null);
+    document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.match(document.querySelector('main').textContent,/평소 사용하는 Codex 실행 명령으로 로그인/);
+  });
+});
+
+test('Overview distinguishes two Weekly provider buckets without discarding the 5H window',async()=>{
+  const account={id:'personal',name:'Personal',trackingCoverage:{status:'full',registeredDevices:1,reportingDevices:1}};
+  const windows=[['codex',10080],['codex_bengalfox',300],['codex_bengalfox',10080]].map(([limitId,durationMinutes])=>({limitId,durationMinutes,usedPercent:12,resetsAt:new Date(Date.now()+600000).toISOString(),coverage:{status:'full'},estimate:{status:'available'},groups:[]}));
+  const fetchImpl=async input=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/accounts')return jsonResponse(200,{accounts:[account]});
+    if(route==='/api/v1/accounts/personal/quota-attribution')return jsonResponse(200,{accountId:'personal',quota:{status:'available',reporterState:'available'},windows});
+    if(route==='/api/v1/usage/summary')return jsonResponse(200,{groups:[]});return jsonResponse(404,{});};
+  await domFixture({fetchImpl},async({document,settle})=>{
+    const tabs=()=>[...document.querySelectorAll('[aria-label="Provider quota window"] button')];assert.deepEqual(tabs().map(node=>node.textContent),['codex · Weekly','codex_bengalfox · 5H','codex_bengalfox · Weekly']);
+    assert.match(document.querySelector('main').textContent,/not a separate local usage counter/);tabs()[2].click();await settle();assert.match(document.querySelector('.cycle-summary h2').textContent,/codex_bengalfox · Weekly/);assert.equal(tabs()[2].getAttribute('aria-pressed'),'true');
   });
 });
 

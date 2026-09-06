@@ -1,4 +1,6 @@
 export const AGENT_CAPABILITY_HEADER = 'x-codex-meter-capabilities';
+// Separate header: old Servers reject unknown fields in the original capability header.
+export const EXISTING_HOME_HEADER = 'x-codex-meter-existing-home';
 export const AGENT_CAPABILITY_HEADER_VALUE = 'agentConfigurationSchema=1;declarativeProfiles=1;actualState=1';
 
 const ALLOWED = new Set(['agentConfigurationSchema', 'declarativeProfiles', 'actualState']);

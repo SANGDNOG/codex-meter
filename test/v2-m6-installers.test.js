@@ -32,6 +32,7 @@ test('M6 manifest validation and verified fetch reject absent target and checksu
   try {
     assert.throws(()=>validateManifest({version:'2',artifacts:{}},'linux-x64'),/no valid artifact/);
     const manifest={version:'2.1.0',artifacts:{'linux-x64':{url:'agent-linux',sha256:digest(bytes)}}};
+    assert.equal(validateManifest({version:'2.1.2',artifacts:{'linux-x64':{url:'agent-linux',sha256:digest(bytes),version:'2.1.1'}}},'linux-x64').version,'2.1.1');
     const calls=[]; const fetchImpl=async url=>{calls.push(String(url));return calls.length===1?response(manifest):response(bytes);};
     assert.equal((await fetchVerifiedArtifact({serverUrl:'https://meter.example',target:'linux-x64',fetchImpl,destination})).version,'2.1.0');
     assert.deepEqual(await readFile(destination),bytes); assert.match(calls[0],/manifest\.json$/); assert.match(calls[1],/agent-linux$/);
@@ -60,7 +61,7 @@ test('M6 Linux installer performs verified enrollment, protects files, registers
     const result=await exec('sh',[path.join(ROOT,'install.sh'),'--server','http://127.0.0.1:9','--token','one_time_token'],{env:{...process.env,PATH:`${mockbin}:${process.env.PATH}`,CODEX_METER_HOME:home,XDG_CONFIG_HOME:path.join(home,'.config'),XDG_STATE_HOME:path.join(home,'.local','state'),CODEX_METER_ALLOW_HTTP_TESTS:'1',CM_MANIFEST:manifest,CM_ARTIFACT:artifact,CM_LOG:log},stdio:['ignore','pipe','pipe']});
     assert.equal(result.code,0,result.err); const bin=path.join(home,'.local','bin','codex-meter-agent'), config=path.join(home,'.local','state','codex-meter','agent.json'), service=path.join(home,'.config','systemd','user','codex-meter-agent.service');
     assert.equal((await stat(config)).mode&0o777,0o600); assert.equal((await stat(service)).mode&0o777,0o600); assert.equal((await stat(bin)).mode&0o777,0o700);
-    assert.match(await readFile(service,'utf8'),/ExecStart=.* run --config/); const commands=await readFile(log,'utf8'); assert.match(commands,/--user daemon-reload/); assert.match(commands,/--user enable --now/); assert.doesNotMatch(commands,/sudo/);
+    assert.match(await readFile(service,'utf8'),/ExecStart=.* run --config/); const commands=await readFile(log,'utf8'); assert.match(commands,/--user daemon-reload/); assert.match(commands,/--user enable --now/); assert.match(commands,/--user restart codex-meter-agent.service/); assert.doesNotMatch(commands,/sudo/);
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 

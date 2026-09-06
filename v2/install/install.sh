@@ -64,6 +64,10 @@ else
 fi
 [ "$ACTUAL" = "$EXPECTED" ] || fail 'artifact checksum mismatch; existing installation was not changed'
 chmod 700 "$CANDIDATE"
+if [ "$MODE" = systemd ]; then
+  SYSTEMCTL=${CODEX_METER_SYSTEMCTL:-systemctl}
+  "$SYSTEMCTL" --user show-environment >/dev/null 2>&1 || fail 'user systemd is unavailable; enable systemd in WSL before enrolling'
+fi
 # Capture Codex from the interactive install environment; services intentionally do not receive a broad PATH.
 CODEX_EXECUTABLE=''
 CODEX_CANDIDATE=$(command -v codex 2>/dev/null || true)
@@ -81,6 +85,10 @@ fi
 chmod 600 "$CONFIG"
 mv -f "$CANDIDATE" "$BIN"
 chmod 700 "$BIN"
+CODEX_METER_EXECUTABLE="$BIN" "$BIN" profile attach-existing --config "$CONFIG" --try-tty || {
+  printf '%s\n' 'Local environment selection was not completed. Tracking waits for your selection.'
+  CODEX_METER_EXECUTABLE="$BIN" "$BIN" profile attach-existing --config "$CONFIG" </dev/null
+}
 
 if [ "$MODE" = systemd ]; then
   BIN_SERVICE=$(systemd_escape "$BIN"); CONFIG_SERVICE=$(systemd_escape "$CONFIG")
@@ -103,6 +111,8 @@ EOF
   SYSTEMCTL=${CODEX_METER_SYSTEMCTL:-systemctl}
   "$SYSTEMCTL" --user daemon-reload
   "$SYSTEMCTL" --user enable --now codex-meter-agent.service
+  # enable --now leaves an already running Agent on the previous credentials.
+  "$SYSTEMCTL" --user restart codex-meter-agent.service
 else
   BIN_XML=$(xml_escape "$BIN"); CONFIG_XML=$(xml_escape "$CONFIG"); STATE_XML=$(xml_escape "$STATE_DIR")
   cat > "$SERVICE" <<EOF

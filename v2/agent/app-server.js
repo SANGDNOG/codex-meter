@@ -1,7 +1,8 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { AGENT_VERSION } from './config.js';
+import { ExistingHomeQuotaRunner, QuotaIsolationError } from './existing-quota-runner.js';
 
-export const QUOTA_ERROR_KINDS = Object.freeze(['codex_not_found', 'app_server_timeout', 'app_server_unavailable', 'not_authenticated', 'malformed_rate_limits', 'ambiguous_limits']);
+export const QUOTA_ERROR_KINDS = Object.freeze(['codex_not_found', 'app_server_timeout', 'app_server_unavailable', 'not_authenticated', 'malformed_rate_limits', 'ambiguous_limits', 'write_isolation_failed']);
 const PLAN_TYPES = new Set(['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu']);
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_WINDOWS = 32;
@@ -73,30 +74,44 @@ class SafeAppServerError extends Error {
   constructor(kind) { super(kind); this.kind = kind; }
 }
 function safeError(error, command) {
+  if (error instanceof QuotaIsolationError) return error;
   if (error instanceof SafeAppServerError) return error;
   if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return new SafeAppServerError('codex_not_found');
   return new SafeAppServerError('app_server_unavailable');
 }
 
 export class ReadOnlyAppServerClient {
-  constructor({ command = 'codex', codexHome = null, timeoutMs = 10_000, maxLineBytes = MAX_LINE_BYTES, spawnImpl = nodeSpawn } = {}) {
+  constructor({ command = 'codex', codexHome = null, readOnlyHome = false, isolationOptions = {}, timeoutMs = 10_000, maxLineBytes = MAX_LINE_BYTES, spawnImpl = nodeSpawn } = {}) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) throw new Error('invalid App Server timeout');
     if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1024 || maxLineBytes > 8 * 1024 * 1024) throw new Error('invalid App Server line bound');
     this.command = command; this.codexHome = codexHome; this.timeoutMs = timeoutMs; this.maxLineBytes = maxLineBytes; this.spawn = spawnImpl; this.nextId = 1; this.pending = new Map(); this.buffer = Buffer.alloc(0); this.discarding = false;
+    this.runner = readOnlyHome ? new ExistingHomeQuotaRunner({ ...isolationOptions, command, codexHome }) : null;
   }
   async start() {
     if (this.child) throw new Error('App Server already started');
     try {
-      this.child = this.spawn(this.command, ['app-server', '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false,
-        env: this.codexHome ? { ...process.env, CODEX_HOME: this.codexHome } : process.env });
+      const isolated = this.runner ? await this.runner.prepare() : null;
+      this.child = this.spawn(isolated?.command ?? this.command, isolated?.args ?? ['app-server', '--stdio'], { stdio: isolated?.stdio ?? ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false,
+        ...(isolated ? { cwd: isolated.cwd } : {}), env: isolated?.env ?? (this.codexHome ? { ...process.env, CODEX_HOME: this.codexHome } : process.env) });
       this.child.stdin?.on('error', (error) => this.#rejectAll(safeError(error, this.command)));
       this.child.stderr?.resume?.(); // Drain, but never retain or log diagnostics.
       this.child.stdout?.on('data', (chunk) => this.#consume(chunk));
       this.child.once('error', (error) => this.#rejectAll(safeError(error, this.command)));
       this.child.once('exit', () => this.#rejectAll(new SafeAppServerError('app_server_unavailable')));
+      await this.runner?.closeHandles();
       await this.#request('initialize', { clientInfo: { name: 'codex-meter-agent', title: 'Codex Meter Agent', version: AGENT_VERSION }, capabilities: null });
       this.#write({ method: 'initialized', params: null });
-    } catch (error) { throw safeError(error, this.command); }
+      if(this.runner){
+        // Requirements can include managed/cloud policy. Verify effective
+        // storage too, before account/quota RPCs, without retaining config data.
+        const config=await this.#request('config/read',{includeLayers:false});
+        const requirements=await this.#request('configRequirements/read',null);
+        if(!object(config?.config)||!object(requirements)||!Object.hasOwn(requirements,'requirements')||requirements.requirements!==null&&!object(requirements.requirements))throw new QuotaIsolationError();
+        for(const mode of [config.config.cli_auth_credentials_store,requirements.requirements?.cliAuthCredentialsStore]){
+          if(mode!==null&&mode!==undefined&&mode!=='file')throw new QuotaIsolationError();
+        }
+      }
+    } catch (error) { throw this.runner && safeError(error, this.command).kind !== 'app_server_timeout' ? new QuotaIsolationError() : safeError(error, this.command); }
   }
   async isAuthenticated() {
     const result = await this.#request('account/read', { refreshToken: false });
@@ -136,18 +151,26 @@ export class ReadOnlyAppServerClient {
   }
   #rejectAll(error) { for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); } this.pending.clear(); }
   async close() {
-    if (!this.child) return;
+    if (!this.child) { await this.runner?.cleanup(); return; }
     const child = this.child; this.child = null;
-    const waitForExit = () => new Promise((resolve) => {
-      if (child.exitCode != null || !child.once) return resolve(true);
-      let settled=false; const finish=(value)=>{if(settled)return;settled=true;resolve(value);};
-      child.once('exit',()=>finish(true)); setTimeout(()=>finish(false),1000).unref();
+    const waitForExit = (timeout=1000) => new Promise((resolve) => {
+      if (child.exitCode != null || child.signalCode != null || !child.once) return resolve(true);
+      let settled=false; const exited=()=>finish(true);
+      const finish=(value)=>{if(settled)return;settled=true;clearTimeout(timer);child.removeListener?.('exit',exited);resolve(value);};
+      const timer=setTimeout(()=>finish(false),timeout);timer.unref();child.once('exit',exited);
     });
-    try { child.stdin?.end?.(); if (child.exitCode == null) child.kill?.('SIGTERM'); } catch { /* best effort */ }
-    if (!await waitForExit()) {
-      try { if (child.exitCode == null) child.kill?.('SIGKILL'); } catch { /* best effort */ }
-      await waitForExit();
+    try { child.stdin?.end?.(); } catch { /* best effort */ }
+    let exited=await waitForExit(250);
+    if (!exited) {
+      try { if (child.exitCode == null && child.signalCode == null) child.kill?.('SIGTERM'); } catch { /* best effort */ }
+      exited=await waitForExit();
     }
+    if (!exited) {
+      try { if (child.exitCode == null) child.kill?.('SIGKILL'); } catch { /* best effort */ }
+      exited=await waitForExit();
+    }
+    await this.runner?.cleanup();
+    if (!exited) throw this.runner ? new QuotaIsolationError() : new SafeAppServerError('app_server_unavailable');
   }
 }
 
@@ -156,12 +179,18 @@ export class QuotaReporter {
   async observe() {
     const observedAt = new Date(this.clock()).toISOString(); const client = new ReadOnlyAppServerClient(this.options);
     const scoped = Object.hasOwn(this.options, 'accountId') ? { accountId: this.options.accountId } : {};
+    let report;
     try {
       await client.start();
-      if (!await client.isAuthenticated()) return { ...scoped, observedAt, status: 'unavailable', errorKind: 'not_authenticated', planType: null, windows: [] };
-      return { ...scoped, ...normalizeQuota(await client.readRateLimits(), observedAt) };
+      report = !await client.isAuthenticated()
+        ? { ...scoped, observedAt, status: 'unavailable', errorKind: 'not_authenticated', planType: null, windows: [] }
+        : { ...scoped, ...normalizeQuota(await client.readRateLimits(), observedAt) };
     } catch (error) {
-      return { ...scoped, observedAt, status: 'unavailable', errorKind: safeError(error, this.options.command ?? 'codex').kind, planType: null, windows: [] };
-    } finally { await client.close(); }
+      report = { ...scoped, observedAt, status: 'unavailable', errorKind: safeError(error, this.options.command ?? 'codex').kind, planType: null, windows: [] };
+    }
+    try { await client.close(); } catch {
+      report = { ...scoped, observedAt, status: 'unavailable', errorKind: this.options.readOnlyHome ? 'write_isolation_failed' : 'app_server_unavailable', planType: null, windows: [] };
+    }
+    return report;
   }
 }

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MeterService, ServiceError } from './service.js';
-import { AGENT_CAPABILITY_HEADER, parseAgentCapabilityHeader } from '../shared/capabilities.js';
+import { AGENT_CAPABILITY_HEADER, EXISTING_HOME_HEADER, parseAgentCapabilityHeader } from '../shared/capabilities.js';
 
 const MAX_BODY = 1024 * 1024;
 const COOKIE = 'codex_meter_session';
@@ -53,6 +53,9 @@ function bearer(request) {
 function agentCapabilities(request) {
   const parsed=parseAgentCapabilityHeader(request.headers[AGENT_CAPABILITY_HEADER]);
   if(parsed===null)throw new ServiceError(400,'invalid_capabilities');
+  const existing=request.headers[EXISTING_HOME_HEADER];
+  if(existing!==undefined&&existing!=='1')throw new ServiceError(400,'invalid_capabilities');
+  if(existing==='1'&&parsed)return{...parsed,existingHomeSelection:true};
   return parsed;
 }
 function adminSession(service, request) {

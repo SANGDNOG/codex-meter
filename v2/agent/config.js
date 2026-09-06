@@ -1,10 +1,10 @@
 import path from 'node:path';
 import os from 'node:os';
-import { chmod, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { parse as parseToml } from 'smol-toml';
-import { AGENT_CAPABILITY_HEADER, AGENT_CAPABILITY_HEADER_VALUE, parseServerCapabilities } from '../shared/capabilities.js';
+import { AGENT_CAPABILITY_HEADER, AGENT_CAPABILITY_HEADER_VALUE, EXISTING_HOME_HEADER, parseServerCapabilities } from '../shared/capabilities.js';
 
-export const AGENT_VERSION = '2.1.1';
+export const AGENT_VERSION = '2.1.3';
 export function defaultStateDirectory() {
   if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'CodexMeter');
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Codex Meter');
@@ -150,16 +150,25 @@ export async function saveConfig(filename, value) {
   } catch (error) { await rm(temporary, { force: true }); throw error; }
 }
 export async function enroll({ serverUrl, token, configPath = defaultConfigPath(), allowHttpForTests = false, codexHome: home, codexExecutable, databasePath } = {}) {
+  let previous=null;
+  try{previous=await loadConfig(configPath);}catch(error){if(error.code!=='ENOENT')throw error;}
   const base = validUrl(serverUrl, allowHttpForTests);
-  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json',[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE }, body: JSON.stringify({ token }) });
+  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json',[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE,[EXISTING_HOME_HEADER]:'1' }, body: JSON.stringify({ token }) });
   if (!response.ok) throw new Error(`enrollment failed (${response.status})`);
   const result = await response.json();
   const serverCapabilities=parseServerCapabilities(result.serverCapabilities);
   if(serverCapabilities===null)throw new Error('enrollment returned invalid Server capabilities');
   const remote = result.agentConfiguration ?? {};
-  const config=await saveConfig(configPath, { serverUrl: result.serverUrl || base, deviceId: result.deviceId, deviceSecret: result.deviceSecret,
-    codexHome: home, codexExecutable, databasePath, allowHttpForTests, syncIntervalMs: remote.syncIntervalSeconds ? remote.syncIntervalSeconds * 1000 : undefined,
+  // Validate the returned identity before using it as a filename. Each new Device
+  // gets its own database; old cursors, outbox, assignments and credentials stay recoverable.
+  const candidate=validateConfig({ serverUrl: result.serverUrl || base, deviceId: result.deviceId, deviceSecret: result.deviceSecret,
+    codexHome: home??previous?.codexHome, codexExecutable:codexExecutable??previous?.codexExecutable, databasePath, allowHttpForTests, syncIntervalMs: remote.syncIntervalSeconds ? remote.syncIntervalSeconds * 1000 : undefined,
     heartbeatIntervalMs: remote.heartbeatIntervalSeconds ? remote.heartbeatIntervalSeconds * 1000 : undefined,
     maxBatchSize: Math.min(remote.maxBatchSize ?? 100, 100) });
+  const requestedDatabase=candidate.databasePath;
+  const reuseRequested=databasePath!==undefined&&(!previous||path.resolve(previous.databasePath)!==requestedDatabase);
+  const nextDatabase=reuseRequested?requestedDatabase:path.join(path.dirname(path.resolve(configPath)),`agent-${candidate.deviceId}.db`);
+  if(previous){const backupPath=`${configPath}.before-enroll-${Date.now()}`;await copyFile(configPath,backupPath);if(process.platform!=='win32')await chmod(backupPath,0o600);}
+  const config=await saveConfig(configPath,{...candidate,databasePath:nextDatabase});
   return{config,desiredConfiguration:serverCapabilities&&remote.schemaVersion===1?remote:null};
 }

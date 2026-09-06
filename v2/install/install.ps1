@@ -55,6 +55,12 @@ try {
   Protect $Config
   Move-Item -Force -LiteralPath $Candidate -Destination $Executable
   Protect $Executable
+  $env:CODEX_METER_EXECUTABLE = $Executable
+  & $Executable profile attach-existing --config $Config
+  if ($LASTEXITCODE -ne 0) {
+    Write-Output 'Local environment selection was not completed. Tracking waits for your selection.'
+    Write-Output "ACTION REQUIRED:`n& '$($Executable.Replace("'", "''"))' profile attach-existing --config '$($Config.Replace("'", "''"))'"
+  }
 
   $TaskCommand = "`"$Executable`" run --config `"$Config`""
   if ($env:CODEX_METER_TEST_TASK_COMMAND) {

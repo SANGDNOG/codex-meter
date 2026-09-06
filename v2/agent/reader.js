@@ -11,7 +11,8 @@ export async function readCompleteLines(filename, offset, {
     || !Number.isSafeInteger(maxLines) || maxLines < 1) throw new TypeError('invalid JSONL read bounds');
   const result = { lines: [], nextOffset: offset, malformedLines: 0, oversizedLines: 0, partialLines: 0, discardUntilNewline };
   let handle;
-  try { handle = await open(filename, 'r'); } catch (error) { if (error.code === 'ENOENT') return { ...result, disappeared: true }; throw error; }
+  const borrowed = typeof filename?.read === 'function';
+  try { handle = borrowed ? filename : await open(filename, 'r'); } catch (error) { if (error.code === 'ENOENT') return { ...result, disappeared: true }; throw error; }
   let position = offset; let lineStart = offset; let chunks = []; let length = 0; let oversized = false;
   try {
     const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -55,15 +56,16 @@ export async function readCompleteLines(filename, offset, {
     result.nextOffset = lineStart;
     if (position > lineStart || result.discardUntilNewline) result.partialLines = 1;
     return result;
-  } finally { await handle.close(); }
+  } finally { if (!borrowed) await handle.close(); }
 }
 
 export async function safeBaseline(filename) {
-  const handle = await open(filename, 'r');
+  const borrowed = typeof filename?.read === 'function';
+  const handle = borrowed ? filename : await open(filename, 'r');
   try {
     const info = await handle.stat();
     if (!info.size) return { offset: 0, discardUntilNewline: false };
     const byte = Buffer.alloc(1); await handle.read(byte, 0, 1, info.size - 1);
     return { offset: info.size, discardUntilNewline: byte[0] !== 10 };
-  } finally { await handle.close(); }
+  } finally { if (!borrowed) await handle.close(); }
 }
