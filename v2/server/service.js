@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { parseSignedInt64, parseUnsignedInt64 } from '../shared/int64.js';
 import { SERVER_CAPABILITIES } from '../shared/capabilities.js';
 import { hashPassword, hashSecret, salt, secret, verifyPassword, verifySecret } from './security.js';
+import { HubService } from './hub.js';
 
 const DIMENSIONS = ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'];
 const COLUMNS = ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'];
@@ -90,7 +91,8 @@ function parseQuotaReport(value) {
 }
 function parseCapabilities(value) {
   if(value===undefined)return{agentConfigurationSchema:null,declarativeProfiles:false,actualState:false};
-  exact(value,['agentConfigurationSchema','declarativeProfiles','actualState'],['existingHomeSelection']);
+  exact(value,['agentConfigurationSchema','declarativeProfiles','actualState'],['existingHomeSelection','opencodexHub']);
+  if(value.opencodexHub!==undefined&&value.opencodexHub!==true)fail(400,'invalid_capabilities');
   if(value.existingHomeSelection!==undefined&&value.existingHomeSelection!==true)fail(400,'invalid_capabilities');
   if(value.agentConfigurationSchema!==1||value.declarativeProfiles!==true||typeof value.actualState!=='boolean')fail(400,'invalid_capabilities');
   return value;
@@ -154,7 +156,7 @@ function addMeasured(target, row) {
 }
 function wireDimensions(values) { return Object.fromEntries(DIMENSIONS.map((key) => [key, values[key].toString()])); }
 function groupWire(row) { return { id: row.id, name: row.name, archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
-function accountWire(row) { return { id: row.id, name: row.name, reference: Boolean(row.reference), archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
+function accountWire(row) { return { id: row.id, name: row.name, measurementSource:row.measurement_source??'native_rollout', reference: Boolean(row.reference), archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
 function bindingWire(row) { return { id: row.id, deviceId: row.device_id, accountId: row.account_id, mode: row.mode === 'legacy' ? 'preserve' : row.mode, createdAt: row.created_at, disabledAt: row.disabled_at }; }
 function membershipAt(database, deviceId, occurredAt) {
   return database.prepare(`SELECT group_id FROM device_group_memberships
@@ -195,6 +197,7 @@ function timezoneTodayStart(now, zone) {
 export class MeterService {
   constructor(database, { adminPassword, serverUrl = '', clock = Date.now, enrollmentTtlMs = 15 * 60_000, sessionTtlMs = 12 * 60 * 60_000, quotaStaleMs = 5 * 60_000, quotaFutureSkewMs = 5 * 60_000 } = {}) {
     this.database = database; this.serverUrl = serverUrl; this.clock = clock; this.enrollmentTtlMs = enrollmentTtlMs; this.sessionTtlMs = sessionTtlMs;
+    this.hub=new HubService(this,ServiceError);
     if(!Number.isSafeInteger(quotaStaleMs)||quotaStaleMs<1000) throw new Error('invalid quotaStaleMs'); this.quotaStaleMs=quotaStaleMs;
     if(!Number.isSafeInteger(quotaFutureSkewMs)||quotaFutureSkewMs<0) throw new Error('invalid quotaFutureSkewMs'); this.quotaFutureSkewMs=quotaFutureSkewMs;
     const auth = database.prepare('SELECT singleton FROM admin_auth WHERE singleton = 1').get();
@@ -233,7 +236,7 @@ export class MeterService {
     return this.database.prepare('SELECT * FROM accounts ORDER BY name,id').all().map((row) => {
       const devices=this.database.prepare(`SELECT COUNT(*) count FROM device_account_bindings b JOIN devices d ON d.id=b.device_id
         WHERE b.account_id=? AND b.disabled_at IS NULL AND d.removed_at IS NULL`).get(row.id).count;
-      return {...accountWire(row),devices,measured:this.usage(rangeValue,{accountId:row.id}).measured,quota:this.accountQuota(row.id),trackingCoverage:this.trackingCoverage(row.id)};
+      return {...accountWire(row),devices,measured:this.usage(rangeValue,{accountId:row.id}).measured,quota:this.accountQuota(row.id),trackingCoverage:this.trackingCoverage(row.id),...(row.measurement_source==='opencodex_proxy'?{usageSource:this.hub.account(row.id)}:{})};
     });
   }
   accountDetail(accountId, rangeValue = 'all') {
@@ -250,12 +253,13 @@ export class MeterService {
       id: group.id, name: group.name, measured: this.usage(rangeValue, { accountId, groupId: group.id }).measured
     }));
     const unassigned = this.usage(rangeValue, { accountId, unassigned: true }).measured;
-    return { ...accountWire(row), measured: this.usage(rangeValue, { accountId }).measured, devices, groups, unassigned, quota: this.accountQuota(accountId), trackingCoverage:this.trackingCoverage(accountId) };
+    return { ...accountWire(row), measured: this.usage(rangeValue, { accountId }).measured, devices, groups, unassigned, quota: this.accountQuota(accountId), trackingCoverage:this.trackingCoverage(accountId),...(row.measurement_source==='opencodex_proxy'?{usageSource:this.hub.account(accountId)}:{}) };
   }
   createAccount(body) {
-    exact(body,['name'],['reference']); if('reference'in body&&typeof body.reference!=='boolean')fail(400,'invalid_field');
+    exact(body,['name'],['reference','measurementSource']); if('reference'in body&&typeof body.reference!=='boolean')fail(400,'invalid_field');
+    const measurementSource=body.measurementSource??'native_rollout';if(!['native_rollout','opencodex_proxy'].includes(measurementSource))fail(400,'invalid_source');
     const now=nowIso(this.clock),account={id:randomUUID(),name:text(body.name,'name'),reference:body.reference===true,archivedAt:null,createdAt:now,updatedAt:now};
-    try{this.database.prepare('INSERT INTO accounts(id,name,reference,created_at,updated_at) VALUES(?,?,?,?,?)').run(account.id,account.name,account.reference?1:0,now,now);}catch(error){if(String(error).includes('UNIQUE'))fail(409,account.reference?'reference_exists':'account_name_exists');throw error;}return account;
+    try{this.database.prepare('INSERT INTO accounts(id,name,reference,created_at,updated_at,measurement_source) VALUES(?,?,?,?,?,?)').run(account.id,account.name,account.reference?1:0,now,now,measurementSource);}catch(error){if(String(error).includes('UNIQUE'))fail(409,account.reference?'reference_exists':'account_name_exists');throw error;}return {...account,measurementSource};
   }
   updateAccount(accountId,body){
     id(accountId,'accountId');exact(body,[],['name','reference','archived']);if(!Object.keys(body).length)fail(400,'invalid_body');const row=this.database.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);if(!row)fail(404,'account_not_found');
@@ -264,6 +268,7 @@ export class MeterService {
     try{tx(this.database,()=>{
       this.database.prepare('UPDATE accounts SET name=?,reference=?,archived_at=?,updated_at=? WHERE id=?').run(name,reference,archived,now,accountId);
       if(archived!==null){
+        this.database.prepare("UPDATE hub_profile_bindings SET disabled_at=?,state='stopped' WHERE account_id=? AND disabled_at IS NULL").run(now,accountId);
         const affected=this.database.prepare('SELECT DISTINCT device_id FROM device_account_bindings WHERE account_id=? AND disabled_at IS NULL').all(accountId);
         // The existing disable trigger closes binding periods. Retain history,
         // but release active/default slots; unarchive never opts tracking in.
@@ -311,6 +316,9 @@ export class MeterService {
   }
   bindAccount(deviceId,body){
     id(deviceId,'deviceId');this.deviceDetail(deviceId);exact(body,['accountId'],['mode','codexHomeKey']);const accountId=id(body.accountId,'accountId');
+    if(this.database.prepare('SELECT measurement_source FROM accounts WHERE id=?').get(accountId)?.measurement_source==='opencodex_proxy'){
+      if(body.codexHomeKey!==undefined||body.mode!=='opencodex')fail(400,'invalid_source_mode');return this.hub.bind(deviceId,accountId);
+    }
     const existing=this.database.prepare('SELECT * FROM device_account_bindings WHERE device_id=? AND account_id=?').get(deviceId,accountId);
     const mode=body.mode===undefined?(existing?.mode??'legacy'):body.mode;if(!BINDING_MODES.has(mode)||mode==='legacy'&&body.codexHomeKey===undefined&&body.mode!==undefined)fail(400,'invalid_mode');
     if(body.codexHomeKey!==undefined&&!metadata(body.codexHomeKey,'codexHomeKey'))fail(400,'invalid_field');
@@ -327,6 +335,7 @@ export class MeterService {
     });}catch(error){if(String(error).includes('UNIQUE'))fail(409,'binding_exists_or_mode_conflict');throw error;}return binding;
   }
   disableBinding(deviceId,bindingId){
+    if(this.database.prepare('SELECT 1 FROM hub_profile_bindings WHERE id=? AND device_id=?').get(bindingId,deviceId))return this.hub.stop(deviceId,bindingId);
     id(deviceId,'deviceId');id(bindingId,'bindingId');const row=this.database.prepare('SELECT * FROM device_account_bindings WHERE id=? AND device_id=?').get(bindingId,deviceId);if(!row)fail(404,'binding_not_found');
     if(row.disabled_at)return bindingWire(row);const now=nowIso(this.clock);tx(this.database,()=>{this.database.prepare('UPDATE device_account_bindings SET disabled_at=? WHERE id=?').run(now,bindingId);this.publishDeviceConfiguration(deviceId);});return bindingWire(this.database.prepare('SELECT * FROM device_account_bindings WHERE id=?').get(bindingId));
   }
@@ -361,7 +370,9 @@ export class MeterService {
     exact(body, ['name'], ['groupId', 'expiresInSeconds','accountId','mode']); const name = text(body.name, 'name'); const groupId = body.groupId == null ? null : id(body.groupId, 'groupId');
     if (groupId && !this.database.prepare('SELECT id FROM groups WHERE id=? AND archived_at IS NULL').get(groupId)) fail(400, 'invalid_group');
     const accountId=body.accountId==null?null:id(body.accountId,'accountId');if(accountId&&!this.database.prepare('SELECT id FROM accounts WHERE id=? AND archived_at IS NULL').get(accountId))fail(400,'invalid_account');
-    const mode=accountId?(body.mode??'default'):null;if(mode!==null&&!['default','isolated','existing'].includes(mode))fail(400,'invalid_mode');if(!accountId&&body.mode!==undefined)fail(400,'invalid_mode');
+    const isHub=accountId&&this.database.prepare('SELECT measurement_source FROM accounts WHERE id=?').get(accountId)?.measurement_source==='opencodex_proxy';
+    if(isHub&&body.mode!=='opencodex')fail(400,'invalid_source_mode');
+    const mode=accountId?(isHub?'default':body.mode??'default'):null;if(mode!==null&&!['default','isolated','existing'].includes(mode))fail(400,'invalid_mode');if(!accountId&&body.mode!==undefined)fail(400,'invalid_mode');
     let ttl = this.enrollmentTtlMs;
     if ('expiresInSeconds' in body) { if (!Number.isInteger(body.expiresInSeconds) || body.expiresInSeconds < 1 || body.expiresInSeconds > 3600) fail(400, 'invalid_field'); ttl = body.expiresInSeconds * 1000; }
     const raw = secret(); const tokenSalt = salt(); const enrollmentId = randomUUID(); const createdAt = nowIso(this.clock); const expiresAt = new Date(this.clock() + ttl).toISOString();
@@ -380,6 +391,8 @@ export class MeterService {
       }
       if (!enrollment) fail(401, 'invalid_enrollment');
       if (enrollment.expires_at <= now) fail(410, 'enrollment_expired');
+      const hubEnrollment=this.database.prepare('SELECT measurement_source FROM accounts WHERE id=?').get(enrollment.account_id)?.measurement_source==='opencodex_proxy';
+      if(hubEnrollment&&!capabilities.opencodexHub)fail(426,'compatible_agent_required');
       if(enrollment.binding_mode==='existing'&&!capabilities.existingHomeSelection)fail(426,'compatible_agent_required');
       const consumed = this.database.prepare('UPDATE device_enrollments SET consumed_at=? WHERE id=? AND consumed_at IS NULL').run(now, enrollment.id);
       if (consumed.changes !== 1) fail(409, 'enrollment_used');
@@ -389,10 +402,12 @@ export class MeterService {
       if (enrollment.group_id) this.database.prepare('INSERT INTO device_group_memberships (id,device_id,group_id,valid_from) VALUES (?,?,?,?)')
         .run(randomUUID(), deviceId, enrollment.group_id, now);
       this.database.prepare('UPDATE devices SET existing_home_supported=? WHERE id=?').run(capabilities.existingHomeSelection?1:0,deviceId);
-      if(enrollment.account_id){this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at,selection_key) VALUES(?,?,?,?,?,?,?)').run(randomUUID(),deviceId,enrollment.account_id,randomUUID(),enrollment.binding_mode,now,enrollment.binding_mode==='existing'?randomUUID():null);this.publishDeviceConfiguration(deviceId);}
+      this.database.prepare('UPDATE devices SET opencodex_supported=? WHERE id=?').run(capabilities.opencodexHub?1:0,deviceId);
+      if(hubEnrollment)this.hub.bind(deviceId,enrollment.account_id,{withinTransaction:true});
+      else if(enrollment.account_id){this.database.prepare('INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at,selection_key) VALUES(?,?,?,?,?,?,?)').run(randomUUID(),deviceId,enrollment.account_id,randomUUID(),enrollment.binding_mode,now,enrollment.binding_mode==='existing'?randomUUID():null);this.publishDeviceConfiguration(deviceId);}
       this.database.prepare('UPDATE device_enrollments SET device_id=? WHERE id=?').run(deviceId, enrollment.id);
       return { deviceId, deviceSecret, serverUrl: this.serverUrl, agentConfiguration: declarative?this.desiredConfiguration(deviceId):this.configuration(),
-        ...(declarative?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}) };
+        ...(declarative?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}),...(capabilities.opencodexHub?{opencodexHub:true}:{}) };
     });
   }
 
@@ -456,7 +471,7 @@ export class MeterService {
     const profiles=this.database.prepare(`SELECT b.*,a.name,a.reference,a.archived_at account_archived_at FROM device_account_bindings b JOIN accounts a ON a.id=b.account_id WHERE b.device_id=? ORDER BY a.name`).all(deviceId).map((binding)=>({
       ...bindingWire(binding),name:binding.name,reference:Boolean(binding.reference),accountArchivedAt:binding.account_archived_at,measured:this.usage('all',{deviceId,accountId:binding.account_id}).measured,...this.profilePresentation(row,binding)
     }));
-    return { ...this.deviceWire(row), memberships, profiles };
+    return { ...this.deviceWire(row), memberships, profiles,hubProfiles:this.hub.deviceProfiles(deviceId) };
   }
   updateDevice(deviceId, body) {
     id(deviceId); exact(body, ['name']); this.deviceDetail(deviceId); const now=nowIso(this.clock);
@@ -474,7 +489,7 @@ export class MeterService {
   }
   disableDevice(deviceId, disabled=true) { id(deviceId); if(typeof disabled!=='boolean') fail(400,'invalid_field'); this.deviceDetail(deviceId); const now=nowIso(this.clock); this.database.prepare('UPDATE devices SET disabled_at=?,updated_at=? WHERE id=?').run(disabled?now:null,now,deviceId); return this.deviceDetail(deviceId); }
   rotateDevice(deviceId) { id(deviceId); this.deviceDetail(deviceId); const raw=secret(); const credentialSalt=salt(); const now=nowIso(this.clock); this.database.prepare('UPDATE devices SET credential_hash=?,credential_salt=?,updated_at=? WHERE id=?').run(hashSecret(raw,credentialSalt),credentialSalt,now,deviceId); return {deviceId,deviceSecret:raw}; }
-  removeDevice(deviceId) { id(deviceId); this.deviceDetail(deviceId); const now=nowIso(this.clock); tx(this.database,()=>{ closeOpenMembership(this.database, deviceId, now); const discardedSecret=secret(); const discardedSalt=salt(); this.database.prepare(`UPDATE devices SET removed_at=?,disabled_at=coalesce(disabled_at,?),current_group_id=NULL,credential_hash=?,credential_salt=?,updated_at=? WHERE id=?`).run(now,now,hashSecret(discardedSecret,discardedSalt),discardedSalt,now,deviceId); }); }
+  removeDevice(deviceId) { id(deviceId); this.deviceDetail(deviceId); const now=nowIso(this.clock); tx(this.database,()=>{ this.database.prepare("UPDATE hub_profile_bindings SET disabled_at=?,state='stopped' WHERE device_id=? AND disabled_at IS NULL").run(now,deviceId); closeOpenMembership(this.database, deviceId, now); const discardedSecret=secret(); const discardedSalt=salt(); this.database.prepare(`UPDATE devices SET removed_at=?,disabled_at=coalesce(disabled_at,?),current_group_id=NULL,credential_hash=?,credential_salt=?,updated_at=? WHERE id=?`).run(now,now,hashSecret(discardedSecret,discardedSalt),discardedSalt,now,deviceId); }); }
 
   sync(device, body, capabilitiesValue) {
     exact(body, ['agentVersion','codexVersion','events','health'],['quotaReport','quotaReports','configurationState']);
@@ -526,6 +541,7 @@ export class MeterService {
       this.database.prepare(`UPDATE devices SET last_seen_at=?,agent_version=?,codex_version=?,health_status=?,agent_configuration_schema=?,declarative_profiles_supported=?,actual_state_supported=?,updated_at=? WHERE id=?`)
         .run(receivedAt,agentVersion,codexVersion,body.health.status,capabilities.agentConfigurationSchema,capabilities.declarativeProfiles?1:0,capabilities.actualState?1:0,receivedAt,device.id);
       this.database.prepare('UPDATE devices SET existing_home_supported=? WHERE id=?').run(capabilities.existingHomeSelection?1:0,device.id);
+      this.database.prepare('UPDATE devices SET opencodex_supported=? WHERE id=?').run(capabilities.opencodexHub?1:0,device.id);
       if(configurationState){
         this.database.prepare('UPDATE devices SET applied_config_revision=?,configuration_status=?,configuration_error_kind=?,configuration_reported_at=? WHERE id=?').run(configurationState.appliedRevision,configurationState.status,configurationState.errorKind,receivedAt,device.id);
         this.database.prepare('DELETE FROM device_profile_status WHERE device_id=?').run(device.id);
@@ -536,7 +552,7 @@ export class MeterService {
       for(const report of profileQuotas)this.replaceAccountQuota(device.id,report.accountId,report.quota);
     });
     return {acceptedEventIds:accepted,duplicateEventIds:duplicate,rejectedEvents:rejected,serverTime:receivedAt,agentConfiguration:capabilities.declarativeProfiles?this.desiredConfiguration(device.id,capabilities.existingHomeSelection===true):this.configuration(),
-      ...(capabilities.declarativeProfiles?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}),isQuotaReporter:reporter===device.id};
+      ...(capabilities.declarativeProfiles?{serverCapabilities:SERVER_CAPABILITIES}:{}),...(capabilities.existingHomeSelection?{existingHomeSelection:true}:{}),...(capabilities.opencodexHub?{opencodexHub:true}:{}),isQuotaReporter:reporter===device.id};
   }
 
   replaceQuota(deviceId,quota){

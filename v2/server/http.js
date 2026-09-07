@@ -55,7 +55,8 @@ function agentCapabilities(request) {
   if(parsed===null)throw new ServiceError(400,'invalid_capabilities');
   const existing=request.headers[EXISTING_HOME_HEADER];
   if(existing!==undefined&&existing!=='1')throw new ServiceError(400,'invalid_capabilities');
-  if(existing==='1'&&parsed)return{...parsed,existingHomeSelection:true};
+  const hub=request.headers['x-codex-meter-opencodex'];if(hub!==undefined&&hub!=='1')throw new ServiceError(400,'invalid_capabilities');
+  if(parsed)return{...parsed,...(existing==='1'?{existingHomeSelection:true}:{}),...(hub==='1'?{opencodexHub:true}:{})};
   return parsed;
 }
 function adminSession(service, request) {
@@ -94,6 +95,13 @@ export function createV2Server({ database, adminPassword, serverUrl = '', clock,
         const credentials = bearer(request); const device = credentials && service.authenticateDevice(credentials.deviceId, credentials.secret);
         if (!device) throw new ServiceError(401, 'invalid_device_credential');
         return json(response, 200, service.sync(device, await body(request),agentCapabilities(request)));
+      }
+      if(path==='/api/v1/agent/hub'&&['GET','POST'].includes(method)){
+        if(!secureTransport(request,trustedProxies))throw new ServiceError(426,'https_required');
+        if(request.headers['x-codex-meter-opencodex']!=='1')throw new ServiceError(426,'compatible_agent_required');
+        const credentials=bearer(request),device=credentials&&service.authenticateDevice(credentials.deviceId,credentials.secret);
+        if(!device)throw new ServiceError(401,'invalid_device_credential');
+        return json(response,200,method==='GET'?service.hub.desired(device):service.hub.report(device,await body(request)));
       }
       const session = adminSession(service, request);
       if (method === 'GET' && path === '/api/v1/auth/session') return json(response, 200, { authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt });

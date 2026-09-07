@@ -6,10 +6,11 @@ import { AgentRuntime, agentStatus, assertProfilesCanonicalDisjoint, bindProfile
 import { applyDesiredConfiguration, importLegacyProfiles } from './assignments.js';
 import { AgentCollector } from './collector.js';
 import { lifecyclePaths, serviceStatus, uninstallInstalledAgent, updateInstalledAgent } from './lifecycle.js';
+import { connectHub, attachOpenCodex } from './opencodex.js';
 import { selectExistingProfiles } from './attach-existing.js';
 
 function option(args, name) { const index = args.indexOf(name); return index < 0 ? null : args[index + 1]; }
-function usage() { return 'usage: codex-meter-agent <run|enroll|status|profile attach-existing|profile-add|profile-launcher|update|uninstall|version>'; }
+function usage() { return 'usage: codex-meter-agent <run|enroll|status|profile attach-existing|profile attach-opencodex|opencodex connect|profile-add|profile-launcher|update|uninstall|version>'; }
 export async function runAgentCli(args = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr } = {}) {
   const command = args[0]; const configPath = option(args, '--config') || defaultConfigPath();
   if (command === 'version' || command === '--version') { stdout.write(`${AGENT_VERSION}\n`); return 0; }
@@ -22,6 +23,14 @@ export async function runAgentCli(args = process.argv.slice(2), { stdout = proce
     stdout.write('enrolled\n'); return 0;
   }
   const config = await loadConfig(configPath);
+  if(command==='opencodex'&&args[1]==='connect'){
+    const database=openAgentDatabase(config.databasePath);try{await connectHub(database,config,{url:option(args,'--url'),secretFile:option(args,'--secret-file'),secretEnv:option(args,'--secret-env'),secretStdin:args.includes('--secret-stdin')});stdout.write('OpenCodex Hub connected. Run profile attach-opencodex on this device.\n');return 0;}finally{database.close();}
+  }
+  if(command==='profile'&&args[1]==='attach-opencodex'){
+    const database=openAgentDatabase(config.databasePath),executable=process.env.CODEX_METER_EXECUTABLE||lifecyclePaths().executable;
+    const quote=value=>process.platform==='win32'?`'${value.replaceAll("'","''")}'`:`'${value.replaceAll("'","'\"'\"'")}'`;
+    try{await attachOpenCodex(database,config,{output:stdout,command:`${process.platform==='win32'?'& ':''}${quote(executable)} profile attach-opencodex --config ${quote(configPath)}`});return 0;}finally{database.close();}
+  }
   if(command==='profile'&&args[1]==='attach-existing'){
     const searchRoots=[];
     for(let index=0;index<args.length;index++)if(args[index]==='--search-root'){
@@ -31,7 +40,7 @@ export async function runAgentCli(args = process.argv.slice(2), { stdout = proce
     const executable=process.env.CODEX_METER_EXECUTABLE||lifecyclePaths().executable;
     const quote=value=>process.platform==='win32'?`'${value.replaceAll("'","''")}'`:`'${value.replaceAll("'","'\"'\"'")}'`;
     const attachCommand=`${process.platform==='win32'?'& ':''}${quote(executable)} profile attach-existing --config ${quote(configPath)}`;
-    try{await selectExistingProfiles(database,config,{home:option(args,'--codex-home'),profileName:option(args,'--profile'),output:stdout,tryTty:args.includes('--try-tty'),command:attachCommand,discover:args.includes('--discover'),searchRoots});return 0;}finally{database.close();}
+    try{await selectExistingProfiles(database,config,{home:option(args,'--codex-home'),profileName:option(args,'--profile'),output:stdout,tryTty:args.includes('--try-tty'),command:attachCommand,discover:args.includes('--discover')||!option(args,'--codex-home'),searchRoots});return 0;}finally{database.close();}
   }
   if (command === 'profile-add') {
     const accountId=option(args,'--account');const name=option(args,'--name');const codexHome=option(args,'--codex-home');const codexExecutable=option(args,'--codex-executable');

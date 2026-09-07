@@ -95,7 +95,7 @@ export class AgentSyncClient {
     const send=async(payload)=>{
       const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),this.timeoutMs);
       try{return await this.fetch(`${this.config.serverUrl}/api/v1/agent/sync`,{method:'POST',signal:controller.signal,
-        headers:{'content-type':'application/json',authorization:`Bearer ${this.config.deviceId}.${this.config.deviceSecret}`,[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE,[EXISTING_HOME_HEADER]:'1'},body:JSON.stringify(payload)});}
+        headers:{'content-type':'application/json',authorization:`Bearer ${this.config.deviceId}.${this.config.deviceSecret}`,[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE,[EXISTING_HOME_HEADER]:'1','x-codex-meter-opencodex':'1'},body:JSON.stringify(payload)});}
       finally{clearTimeout(timer);}
     };
     let response;
@@ -153,6 +153,6 @@ export class AgentSyncClient {
       this.database.exec('COMMIT');
     } catch (error) { this.database.exec('ROLLBACK'); throw error; }
     return { sent: rows.length, acknowledged: acknowledged.size, rejected: permanentlyRejected.size, pending: this.pending(), configuration: serverCapabilities?result.agentConfiguration??null:null,
-      isQuotaReporter: result.isQuotaReporter === true };
+      isQuotaReporter: result.isQuotaReporter === true, opencodexHub:result.opencodexHub===true };
   }
 }

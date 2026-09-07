@@ -7,6 +7,7 @@ import { AGENT_VERSION } from './config.js';
 import { applyDesiredConfiguration, assignmentRows, importLegacyProfiles } from './assignments.js';
 import { canonicalHome, homesOverlap } from './paths.js';
 import { discoverExistingRollouts } from './existing-home.js';
+import { HubAdapter } from './opencodex.js';
 import { rootIdentityMatches } from './existing-root.js';
 
 export { canonicalHome } from './paths.js';
@@ -38,6 +39,7 @@ export async function bindProfileHome(database, profile) {
 export class AgentRuntime {
   constructor(database, config, options = {}) {
     this.database = database; this.config = config;
+    this.hubAdapter=options.hubAdapter??new HubAdapter(database,config);
     this.fixedCollectors=options.fixedCollectors===true;
     this.collectorFactory=options.collectorFactory??((entry)=>new AgentCollector(database,{home:entry.localHome??entry.codexHome,accountId:entry.accountId??null,...(entry.mode==='existing'?{bindingKey:`${entry.accountId}:${entry.selectionKey}`,discovery:discoverExistingRollouts}:{})}));
     this.watchImpl=options.watchImpl??watch;this.applyOptions=options.applyOptions??{};
@@ -105,7 +107,7 @@ export class AgentRuntime {
       await this.refreshLocalAssignments();
       if (Date.now() < this.nextSyncAt) return { skipped: true, backoff: true, retryAt: new Date(this.nextSyncAt).toISOString() };
       const health = { status: this.database.prepare("SELECT value FROM agent_state WHERE key='last_collect_status'").get()?.value === 'degraded' ? 'degraded' : 'healthy' };
-      if (!this.syncing) this.syncing = this.syncClient.sync({ heartbeat, health, collectQuota }).then(async(result) => {this.backoffMs=1000;this.nextSyncAt=0;result.configurationApply=await this.applyConfigurationUnlocked(result.configuration);return result;})
+      if (!this.syncing) this.syncing = this.syncClient.sync({ heartbeat, health, collectQuota }).then(async(result) => {this.backoffMs=1000;this.nextSyncAt=0;result.configurationApply=await this.applyConfigurationUnlocked(result.configuration);if(heartbeat&&collectQuota&&result.opencodexHub){try{await this.hubAdapter.sync();setState(this.database,'hub_sync_status','healthy');}catch{setState(this.database,'hub_sync_status','unavailable');}}return result;})
         .catch((error) => { this.nextSyncAt = Date.now() + this.backoffMs; this.backoffMs = Math.min(this.backoffMs * 2, 5 * 60_000);const diagnostic=this.database.prepare("SELECT value FROM agent_state WHERE key='last_sync_error_kind'").get()?.value;if(diagnostic)console.error(`Codex Meter sync failed: ${diagnostic}`);throw error; })
         .finally(() => { this.syncing = null; });
       return this.syncing;

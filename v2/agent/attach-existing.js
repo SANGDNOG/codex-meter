@@ -71,7 +71,7 @@ export async function attachExistingHome(database,config,profile,input,expectedC
   return{name:selected.name,home};
 }
 
-export async function selectExistingProfiles(database,config,{home=null,profileName=null,input=process.stdin,output=process.stdout,question=null,tryTty=false,command,discover=false,searchRoots=null}={}){
+export async function selectExistingProfiles(database,config,{home=null,profileName=null,input=process.stdin,output=process.stdout,question=null,tryTty=false,command,discover=!home,searchRoots=null}={}){
   if(home&&(discover||searchRoots?.length))throw new Error('Use either --codex-home or interactive discovery, not both.');
   if(searchRoots?.length&&!discover)throw new Error('--search-root requires --discover.');
   let pending=pendingExistingProfiles(database);
@@ -101,6 +101,7 @@ export async function selectExistingProfiles(database,config,{home=null,profileN
     const expectedCandidate=typeof entered==='object'?entered:null;
     await attachExistingHome(database,config,selected,expectedCandidate?expectedCandidate.path:entered,expectedCandidate);
     output.write(`${terminalName(selected.name)}: existing environment attached. The Agent applies tracking automatically.\n`);
+    output.write('All Codex clients using the selected CODEX_HOME are tracked, including Codex CLI and Codex IDE extensions.\n');
     pending=pendingExistingProfiles(database);
     if(pending.length)output.write(`ACTION REQUIRED:\n${command}\n`);
     return{selected:1,pending:pending.length};

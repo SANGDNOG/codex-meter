@@ -58,7 +58,7 @@ test('server migration creates the complete M1 schema and indexes', async () => 
     assert.deepEqual(tables, [
       'account_quota_current', 'account_quota_snapshots', 'accounts', 'admin_auth', 'admin_sessions', 'device_account_binding_periods', 'device_account_bindings',
       'device_configuration_revision_profiles', 'device_configuration_revisions', 'device_enrollments', 'device_group_memberships',
-      'device_profile_status', 'devices', 'groups', 'quota_current',
+      'device_profile_status', 'devices', 'groups', 'hub_profile_bindings', 'hub_quota_current', 'hub_usage_current', 'quota_current',
       'quota_snapshots', 'schema_migrations', 'server_settings', 'usage_adjustments', 'usage_events'
     ]);
     const indexes = database.prepare(`SELECT name FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name`).all().map(({ name }) => name);
@@ -87,12 +87,12 @@ test('server migrations 007 through 009 upgrade an existing V2.1 database and re
     database.prepare("INSERT INTO devices(id,name,credential_hash,created_at,updated_at) VALUES('d','cx1','hash','t','t')").run();
     database.prepare("INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,created_at) VALUES('b','d','a','legacy-home','t')").run();database.close();
     database=new DatabaseSync(filename);database.exec('PRAGMA foreign_keys=ON');migrateDatabase(database,source);
-    assert.equal(scalar(database,'SELECT COUNT(*) count FROM schema_migrations').count,9);
+    assert.equal(scalar(database,'SELECT COUNT(*) count FROM schema_migrations').count,10);
     assert.deepEqual({...database.prepare("SELECT desired_config_revision,applied_config_revision,configuration_status FROM devices WHERE id='d'").get()},{desired_config_revision:1,applied_config_revision:0,configuration_status:'unknown'});
     assert.deepEqual({...database.prepare("SELECT binding_id,account_id,name,mode FROM device_configuration_revision_profiles WHERE device_id='d' AND revision=1").get()},{binding_id:'b',account_id:'a',name:'Personal',mode:'legacy'});
     assert.equal(database.prepare("SELECT mode FROM device_account_bindings WHERE id='b'").get().mode,'legacy');
     assert.deepEqual({...database.prepare("SELECT binding_id,valid_from,valid_until,legacy_history FROM device_account_binding_periods WHERE binding_id='b'").get()},{binding_id:'b',valid_from:'t',valid_until:null,legacy_history:1});
-    migrateDatabase(database,source);assert.equal(scalar(database,'SELECT COUNT(*) count FROM schema_migrations').count,9);database.close();
+    migrateDatabase(database,source);assert.equal(scalar(database,'SELECT COUNT(*) count FROM schema_migrations').count,10);database.close();
   }finally{await rm(root,{recursive:true,force:true});}
 });
 
@@ -112,7 +112,7 @@ test('server foreign keys are enforced and migrations remain idempotent', async 
     database = null;
     const reopened = openServerDatabase(filename);
     try {
-      assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM schema_migrations').count, 9);
+      assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM schema_migrations').count, 10);
       assert.equal(scalar(reopened, 'SELECT COUNT(*) AS count FROM groups').count, 1);
       assert.equal(scalar(reopened, 'PRAGMA foreign_keys').foreign_keys, 1);
     } finally { reopened.close(); }

@@ -219,6 +219,40 @@ test('V2.1 Web/API add account hot-applies through a live Agent sync and reports
 }));
 
 function jsonResponse(status,value){return new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json'}});}
+
+test('OpenCodex source chooser creates a Hub Profile and hides Native environment modes on enrollment',async()=>{
+  const hub={id:'hub-profile',name:'Hub selected',measurementSource:'opencodex_proxy'},created=[];
+  const fetchImpl=async(input,init={})=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts'&&init.method==='POST'){created.push(JSON.parse(init.body));return jsonResponse(201,hub);}
+    if(route==='/api/v1/accounts')return jsonResponse(200,{accounts:created.length?[hub]:[]});
+    if(route==='/api/v1/devices'&&init.method==='POST'){created.push(JSON.parse(init.body));return jsonResponse(400,{error:'synthetic-stop-before-enrollment'});}
+    return jsonResponse(404,{});
+  };
+  await domFixture({url:'https://meter.example/#/devices/add',fetchImpl},async({window,document,settle})=>{
+    document.querySelector('[data-testid="new-profile-from-onboarding"]').click();await settle();
+    const source=document.querySelector('[data-testid="measurement-source"]');assert.ok(source);source.value='opencodex_proxy';
+    document.querySelector('[data-testid="profile-name"]').value=hub.name;document.querySelector('[data-testid="save-profile"]').click();await settle();
+    assert.equal(created[0].measurementSource,'opencodex_proxy');assert.equal(document.querySelector('[data-testid="initial-environment-current"]').closest('fieldset').hidden,true);
+    document.querySelector('[data-testid="device-name"]').value='Hub reporter';document.querySelector('[data-testid="add-device-form"]').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));await settle();
+    assert.equal(created[1].mode,'opencodex');assert.equal(created[1].accountId,hub.id);assert.ok(!JSON.stringify(created).includes('logLabel'));
+  });
+});
+test('Hub account detail renders observed ranges/coverage/quota but no Native Device/Group attribution',async()=>{
+  const snap={observedAt:'2026-09-07T12:00:00.000Z',tokens:{totalTokens:'25'},coverage:0.987};
+  const source={ranges:Object.fromEntries(['today','7d','30d','all'].map(r=>[r,{status:'available',lastKnownGood:snap}])),quota:{status:'available',lastKnownGood:{windows:[{limitId:'short',durationMinutes:300,usedPercent:12,resetsAt:null},{limitId:'weekly',durationMinutes:10080,usedPercent:24,resetsAt:null}]}}};
+  const fetchImpl=async input=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/accounts/hub')return jsonResponse(200,{id:'hub',name:'<img src=x onerror=alert(1)>',measurementSource:'opencodex_proxy',usageSource:source,devices:[],groups:[]});
+    if(route==='/api/v1/accounts/hub/quota-attribution')return jsonResponse(200,emptyAttribution('hub'));return jsonResponse(404,{});
+  };
+  await domFixture({url:'https://meter.example/#/accounts/hub',fetchImpl},async({document,settle})=>{
+    const panel=document.querySelector('[data-testid="hub-account-panel"]');assert.ok(panel);assert.match(panel.textContent,/98\.7%/);assert.match(panel.textContent,/5H/);assert.match(panel.textContent,/Weekly/);
+    assert.match(panel.textContent,/Not attributed by device/);assert.equal(document.querySelector('main img'),null);assert.doesNotMatch(document.querySelector('main').textContent,/Group breakdown|Tracked devices|Estimated quota contribution/);
+    document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.match(document.querySelector('main').textContent,/OpenCodex 관측 사용량/);
+  });
+});
 function emptyUsage(){return{measured:{...ZERO},adjusted:{totalTokens:'0'},combined:{totalTokens:'0'}};}
 function unavailableQuota(){return{observedAt:null,status:'unavailable',reporterState:'no_reporter',reporterDeviceId:null,errorKind:null,planType:null,windows:[]};}
 function emptyAttribution(accountId){return{accountId,quota:unavailableQuota(),windows:[],warnings:[]};}

@@ -106,7 +106,7 @@ test('Local discovery cancellation and non-TTY invocation never attach or establ
   assert.equal(database.prepare('SELECT COUNT(*) n FROM existing_home_selections').get().n,0);
   assert.equal(database.prepare('SELECT COUNT(*) n FROM rollout_cursors').get().n,0);
   await assert.rejects(selectExistingProfiles(database,config,{home:homes[0],discover:true}),/not both/);
-  await assert.rejects(selectExistingProfiles(database,config,{searchRoots:[path.dirname(homes[0])]}),/requires --discover/);
+  await assert.rejects(selectExistingProfiles(database,config,{discover:false,searchRoots:[path.dirname(homes[0])]}),/requires --discover/);
 }));
 
 test('M1 recreated candidate with reused dev/inode rejects 777 tokens before attachment or any baseline, then explicit reselection works',()=>fixture(async({database,config,homes,files})=>{
@@ -253,7 +253,7 @@ test('Local CLI exact profile selection hot-activates only Home A; baseline 100 
   await applyDesiredConfiguration(database,config,desired());
   const client=new AgentSyncClient(database,config,{clock:()=>NOW+120000,quotaReporterFactory:entry=>({accountId:entry.accountId,home:entry.localHome,async observe(){probed.push(entry.localHome);return{accountId:entry.accountId,status:'unavailable',errorKind:'not_authenticated',observedAt:new Date(NOW).toISOString(),windows:[]};}}),fetchImpl:async(_url,init)=>{wire.push(JSON.parse(init.body));return new Response(JSON.stringify({acceptedEventIds:wire.at(-1).events.map(e=>e.eventId),duplicateEventIds:[],rejectedEvents:[],serverTime:new Date(NOW).toISOString(),serverCapabilities:SERVER_CAPABILITIES,existingHomeSelection:true}),{status:200});}});
   const runtime=new AgentRuntime(database,config,{syncClient:client,watchImpl:root=>{watched.push(root);return{close(){}};}});runtime.running=true;
-  const output=quiet();const answers=[homes[0]];
+  const output=quiet();const answers=['0',homes[0]];
   await selectExistingProfiles(database,config,{question:async()=>answers.shift(),output,command:'installed-agent profile attach-existing'});
   assert.match(output.text,/Account Profile: Personal/);assert.doesNotMatch(output.text,/binding-personal|selection-personal/);
   assert.equal(database.prepare('SELECT byte_offset FROM rollout_cursors').get().byte_offset,(await stat(files[0])).size);
@@ -335,7 +335,7 @@ test('Stop and offline missed stop/re-add require fresh local selection, preserv
 
 test('Two unresolved profiles choose by readable name/number with no UUID and keep the other unresolved',()=>fixture(async({database,config,homes})=>{
   await applyDesiredConfiguration(database,config,desired([declaration(),declaration('research')]));
-  const answers=['2',homes[0]],output=quiet();await selectExistingProfiles(database,config,{question:async()=>answers.shift(),output,command:'real-agent profile attach-existing'});
+  const answers=['2','0',homes[0]],output=quiet();await selectExistingProfiles(database,config,{question:async()=>answers.shift(),output,command:'real-agent profile attach-existing'});
   assert.match(output.text,/1\. Personal\n2\. Research/);assert.doesNotMatch(output.text,/binding-|selection-/);
   await activate(database,config);
   assert.equal(assignmentRows(database).find(row=>row.name==='Research').localHome,homes[0]);assert.equal(pendingExistingProfiles(database)[0].name,'Personal');
@@ -346,6 +346,15 @@ test('No TTY prints a concrete local command, never guesses a home',()=>fixture(
   await applyDesiredConfiguration(database,config,desired());const output=quiet();
   const result=await selectExistingProfiles(database,config,{input:{isTTY:false},output,command:"'/home/test/.local/bin/codex-meter-agent' profile attach-existing"});
   assert.equal(result.selected,0);assert.match(output.text,/ACTION REQUIRED:\n'\/home\/test\/\.local\/bin\/codex-meter-agent' profile attach-existing/);assert.equal(assignmentRows(database)[0].localHome,null);
+}));
+
+test('CLI and IDE rollouts using the same selected Home remain one Native Profile',()=>fixture(async({database,config,homes,files})=>{
+  const ide=path.join(homes[0],'sessions','rollout-11111111-1111-4111-8111-111111111119.jsonl');
+  await writeFile(ide,JSON.stringify({type:'session_meta',payload:{id:'11111111-1111-4111-8111-111111111119',source:'vscode'}})+'\n'+usage(100,0));
+  await applyDesiredConfiguration(database,config,desired());await attachExistingHome(database,config,declaration(),homes[0]);await activate(database,config);
+  await appendFile(files[0],usage(25));await appendFile(ide,usage(30));
+  const runtime=new AgentRuntime(database,config);await runtime.reconcile();
+  const rows=database.prepare('SELECT account_id,total_tokens FROM usage_outbox').all();assert.equal(rows.length,2);assert.ok(rows.every(row=>row.account_id==='personal'));assert.equal(rows.reduce((n,row)=>n+row.total_tokens,0),55);await runtime.stop();
 }));
 
 test('CLI --codex-home works without UUID, config edit or service restart, including shell metacharacters',()=>fixture(async({root,database,config})=>{
@@ -401,7 +410,7 @@ test('Migration 009 upgrades populated deployed 008 and 006 upgrades local 005 w
       old.exec("INSERT INTO accounts(id,name,reference,created_at,updated_at) VALUES('a','Personal',0,'t','t'); INSERT INTO devices(id,name,credential_hash,created_at,updated_at) VALUES('d','Laptop','hash','t','t'); INSERT INTO device_account_bindings(id,device_id,account_id,codex_home_key,mode,created_at) VALUES('b','d','a','default','default','t'); INSERT INTO device_profile_status(device_id,binding_id,account_id,mode,state,reported_at) VALUES('d','b','a','default','tracking','t');");
     }else old.exec("INSERT INTO profile_assignments(binding_id,account_id,name,mode,origin,local_home,active,desired_revision,applied_revision,state,created_at,updated_at) VALUES('b','a','Personal','preserve','imported','/existing/legacy',1,0,0,'tracking','t','t');");
     old.close();const upgraded=kind==='server'?openServerDatabase(file):openAgentDatabase(file);
-    try{assert.deepEqual(upgraded.prepare('PRAGMA foreign_key_check').all(),[]);assert.equal(upgraded.prepare('SELECT COUNT(*) n FROM schema_migrations').get().n,last+1);
+    try{assert.deepEqual(upgraded.prepare('PRAGMA foreign_key_check').all(),[]);assert.equal(upgraded.prepare('SELECT COUNT(*) n FROM schema_migrations').get().n,names.filter(name=>name.endsWith('.sql')).length);
       if(kind==='server'){assert.equal(upgraded.prepare("SELECT mode FROM device_account_bindings WHERE id='b'").get().mode,'default');assert.equal(upgraded.prepare("SELECT state FROM device_profile_status WHERE binding_id='b'").get().state,'tracking');}
       else{assert.equal(assignmentRows(upgraded)[0].localHome,'/existing/legacy');assert.equal(assignmentRows(upgraded)[0].origin,'imported');}
     }finally{upgraded.close();}

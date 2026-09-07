@@ -153,7 +153,7 @@ export async function enroll({ serverUrl, token, configPath = defaultConfigPath(
   let previous=null;
   try{previous=await loadConfig(configPath);}catch(error){if(error.code!=='ENOENT')throw error;}
   const base = validUrl(serverUrl, allowHttpForTests);
-  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json',[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE,[EXISTING_HOME_HEADER]:'1' }, body: JSON.stringify({ token }) });
+  const response = await fetch(`${base}/api/v1/agent/enroll`, { method: 'POST', headers: { 'content-type': 'application/json',[AGENT_CAPABILITY_HEADER]:AGENT_CAPABILITY_HEADER_VALUE,[EXISTING_HOME_HEADER]:'1','x-codex-meter-opencodex':'1' }, body: JSON.stringify({ token }) });
   if (!response.ok) throw new Error(`enrollment failed (${response.status})`);
   const result = await response.json();
   const serverCapabilities=parseServerCapabilities(result.serverCapabilities);
