@@ -240,6 +240,27 @@ node bin/v2-server.js
 
 설치 명령의 enrollment token은 짧은 시간만 유효하고 한 번만 사용할 수 있습니다. Server는 hash만 저장합니다. 성공적인 enrollment는 token을 Device credential로 교환하며, 이 credential은 권한이 제한된 Agent local configuration에 저장되고 URL query에는 포함되지 않습니다.
 
+### OpenCodex Hub (V2.2 candidate)
+
+웹에서 **Measurement source → OpenCodex Hub**로 Account Profile과 Device를
+생성하고, wizard를 포함한 candidate Agent로 해당 Device의 설치·등록 명령을
+실행합니다. 그 다음 Agent가 있는 기기에서 다음 명령을 실행합니다.
+
+```sh
+codex-meter-agent opencodex setup
+```
+
+Hub URL을 입력하고 Linux/macOS에서는 화면에 표시되지 않는 credential 입력을
+완료한 뒤 계정 하나를 직접 선택합니다. Windows는 credential 파일을 새로 저장하지
+않고 사용자가 명시적으로 설정한 credential 환경변수의 이름을 입력받습니다.
+기존 연결은 재사용하며, 실행 중인 Agent에는 서비스 재시작 없이 반영됩니다.
+Wizard는 Server Profile을 임의 생성하거나 계정을 자동 선택하지 않습니다.
+TTY가 없는 환경의 기존 고급 명령은 [OpenCodex 설정 문서](docs/v2-opencodex-hub.md)를
+참고하세요.
+
+이 wizard는 아직 배포되지 않은 UX 변경입니다. `0b0e34e` checkpoint의 실제 Canary
+통과 결과를 이 wizard 수정본의 검증 결과로 간주하지 않습니다.
+
 ## Agent 운영
 
 Installer는 사용자 권한 systemd service, LaunchAgent 또는 최소 권한 Windows scheduled task를 등록합니다. 설치 directory가 `PATH`에 없어도 실행되도록 다음과 같이 전체 경로를 사용합니다.

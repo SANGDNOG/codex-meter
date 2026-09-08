@@ -6,14 +6,15 @@ import { AgentRuntime, agentStatus, assertProfilesCanonicalDisjoint, bindProfile
 import { applyDesiredConfiguration, importLegacyProfiles } from './assignments.js';
 import { AgentCollector } from './collector.js';
 import { lifecyclePaths, serviceStatus, uninstallInstalledAgent, updateInstalledAgent } from './lifecycle.js';
-import { connectHub, attachOpenCodex } from './opencodex.js';
+import { connectHub, attachOpenCodex, setupOpenCodex } from './opencodex.js';
 import { selectExistingProfiles } from './attach-existing.js';
 
 function option(args, name) { const index = args.indexOf(name); return index < 0 ? null : args[index + 1]; }
-function usage() { return 'usage: codex-meter-agent <run|enroll|status|profile attach-existing|profile attach-opencodex|opencodex connect|profile-add|profile-launcher|update|uninstall|version>'; }
+function usage() { return 'usage: codex-meter-agent <run|enroll|status|profile attach-existing|opencodex setup|profile attach-opencodex|opencodex connect|profile-add|profile-launcher|update|uninstall|version>'; }
 export async function runAgentCli(args = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr } = {}) {
   const command = args[0]; const configPath = option(args, '--config') || defaultConfigPath();
   if (command === 'version' || command === '--version') { stdout.write(`${AGENT_VERSION}\n`); return 0; }
+  if(command==='opencodex'&&args[1]==='setup'&&args.includes('--help')){stdout.write(`${usage()}\nOpenCodex Hub: opencodex setup (interactive). Advanced: opencodex connect, then profile attach-opencodex.\n`);return 0;}
   if (command === 'enroll') {
     const serverUrl = option(args, '--server'); const token = option(args, '--token');
     if (!serverUrl || !token) throw new Error('enroll requires --server and --token');
@@ -22,7 +23,20 @@ export async function runAgentCli(args = process.argv.slice(2), { stdout = proce
     if(enrollment.desiredConfiguration){const database=openAgentDatabase(enrollment.config.databasePath);try{await importLegacyProfiles(database,enrollment.config);const applied=await applyDesiredConfiguration(database,enrollment.config,enrollment.desiredConfiguration);if(!applied.applied&&!applied.idempotent)throw applied.error??new Error('initial desired configuration failed');}finally{database.close();}}
     stdout.write('enrolled\n'); return 0;
   }
-  const config = await loadConfig(configPath);
+  let config;
+  try{config=await loadConfig(configPath);}catch(error){
+    if(command==='opencodex'&&args[1]==='setup'){
+      stderr.write('ACTION REQUIRED:\nInstall/enroll this Agent using the Device enrollment command before OpenCodex setup. Verify the selected Agent configuration is readable and valid.\n');return 1;
+    }
+    throw error;
+  }
+  if(command==='opencodex'&&args[1]==='setup'){
+    const database=openAgentDatabase(config.databasePath),executable=process.env.CODEX_METER_EXECUTABLE||lifecyclePaths().executable;
+    const quote=value=>process.platform==='win32'?`'${value.replaceAll("'","''")}'`:`'${value.replaceAll("'","'\"'\"'")}'`;
+    const base=`${process.platform==='win32'?'& ':''}${quote(executable)}`;
+    try{const result=await setupOpenCodex(database,config,{output:stdout,connectCommand:`${base} opencodex connect --config ${quote(configPath)}`,attachCommand:`${base} profile attach-opencodex --config ${quote(configPath)}`});return result.status==='action_required'?1:0;}
+    finally{database.close();}
+  }
   if(command==='opencodex'&&args[1]==='connect'){
     const database=openAgentDatabase(config.databasePath);try{await connectHub(database,config,{url:option(args,'--url'),secretFile:option(args,'--secret-file'),secretEnv:option(args,'--secret-env'),secretStdin:args.includes('--secret-stdin')});stdout.write('OpenCodex Hub connected. Run profile attach-opencodex on this device.\n');return 0;}finally{database.close();}
   }

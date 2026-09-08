@@ -240,6 +240,27 @@ Populate and verify `releases` before starting. Run the process under one servic
 
 The enrollment token in the command is short-lived and one-time. The Server stores only its hash. Successful enrollment exchanges it for a Device credential, which is stored in a permission-restricted local Agent configuration and is never placed in a URL query.
 
+### OpenCodex Hub (V2.2 candidate)
+
+Create an Account Profile with **Measurement source → OpenCodex Hub**, create
+its Device, and run that Device's installer/enrollment command with a
+wizard-capable candidate Agent. Then run on the Agent machine:
+
+```sh
+codex-meter-agent opencodex setup
+```
+
+Enter the Hub origin and, on Linux/macOS, the credential at the hidden prompt;
+then explicitly select one account. Windows asks for the name of an explicitly
+configured credential environment variable instead of saving a credential file.
+An existing connection is reused. A running Agent picks up the selection without
+a service restart. The wizard never creates a Server Profile or selects an
+account for you. Without a terminal, use the existing advanced commands described
+in [OpenCodex setup](docs/v2-opencodex-hub.md).
+
+The wizard is an unreleased UX change; the real Canary result for checkpoint
+`0b0e34e` does not validate this newer wizard tree.
+
 ## Agent operations
 
 The installer registers a per-user systemd service, LaunchAgent, or least-privilege Windows scheduled task. Use the installed executable's full path so the commands also work when its directory is not in `PATH`.

@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { open, mkdir, rename, unlink } from 'node:fs/promises';
+import { open, mkdir, rename, unlink, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { Readable } from 'node:stream';
+import { setupQuestion } from './setup-terminal.js';
 import { HUB_RANGES, HUB_TOKENS, HUB_COUNTS, validateHubUsage, validateHubQuota, exactHub } from '../shared/hub-snapshot.js';
 
 const LABEL=/^(main|p[a-f0-9]{6})$/;
@@ -127,9 +129,63 @@ export function validateHubDesired(result){
   return result;
 }
 function pruneSelections(database,profiles){const ids=new Set(profiles.map(p=>p.bindingId));for(const row of database.prepare('SELECT binding_id FROM hub_selections').all())if(!ids.has(row.binding_id))database.prepare('DELETE FROM hub_selections WHERE binding_id=?').run(row.binding_id);}
-export async function attachOpenCodex(database,config,{input=process.stdin,output=process.stdout,question,command='codex-meter-agent profile attach-opencodex',fetchImpl=fetch}={}){
+async function pendingHubProfiles(database,config,fetchImpl){
   const desired=await meterHubRequest(config,'GET',undefined,fetchImpl);pruneSelections(database,desired.profiles);
   const pending=desired.profiles.filter(p=>!database.prepare('SELECT 1 FROM hub_selections WHERE binding_id=? AND account_id=?').get(p.bindingId,p.accountId));
+  return{desired,pending};
+}
+export async function setupOpenCodex(database,config,{input=process.stdin,output=process.stdout,question,secretQuestion,platform=process.platform,fetchImpl=fetch,
+  connectCommand='codex-meter-agent opencodex connect',attachCommand='codex-meter-agent profile attach-opencodex'}={}){
+  if(!config?.deviceId||!config?.deviceSecret)problem('agent_enrollment_required');
+  const {desired,pending}=await pendingHubProfiles(database,config,fetchImpl);
+  if(!pending.length){
+    output.write('No OpenCodex Hub profile is waiting for setup.\n');
+    if(desired.profiles.length){
+      try{
+        const connection=await loadConnection(config);
+        new OpenCodexClient(connection,{fetchImpl}); // Validate origin without contacting the Hub.
+        if(!connection.connectionId||desired.profiles.some(p=>database.prepare('SELECT connection_id FROM hub_selections WHERE binding_id=? AND account_id=?').get(p.bindingId,p.accountId)?.connection_id!==connection.connectionId))problem('hub_connection_required');
+        await credential(connection.credential);
+      }catch{
+        output.write('ACTION REQUIRED:\nExisting OpenCodex setup needs attention. Verify the local Hub connection and its credential file/environment variable. No selections were changed. Use the advanced connection recovery instructions; setup will not reconnect automatically.\n');
+        return{status:'action_required'};
+      }
+    }
+    output.write(desired.profiles.length?'OpenCodex is already configured for this device.\n':'Add an OpenCodex Hub Profile to this Device in the dashboard first.\n');
+    return{status:desired.profiles.length?'configured':'no_pending'};
+  }
+  if(!input.isTTY||!output.isTTY){
+    output.write(`ACTION REQUIRED:\nInteractive setup needs a terminal. Use the existing manual commands:\n${connectCommand} --url <HUB_ORIGIN> ${platform==='win32'?'--secret-env <VARIABLE_NAME>':'--secret-file <PRIVATE_CREDENTIAL_FILE>'}\n${attachCommand}\nAccount selection requires an interactive terminal.\n`);
+    return{status:'action_required'};
+  }
+  const ask=question??(prompt=>setupQuestion(prompt,{input,output}));
+  const askSecret=secretQuestion??(prompt=>setupQuestion(prompt,{input,output,secret:true}));
+  output.write('OpenCodex Hub setup\n');
+  let connectionExists=true;
+  try{await lstat(connectionPath(config));}catch(error){if(error.code==='ENOENT')connectionExists=false;else problem('hub_connection_required');}
+  if(connectionExists){
+    // Invalid/private-file errors are not permission to overwrite a connection.
+    await new OpenCodexClient(await loadConnection(config),{fetchImpl}).accounts();
+  }else{
+    if(database.prepare('SELECT 1 FROM hub_selections LIMIT 1').get())problem('hub_connection_required');
+    const url=safeURL(await ask('Hub URL: '));
+    if(platform==='win32'){
+      output.write('Use an explicitly configured credential environment variable. The background Agent must receive the same variable. No credential file will be created.\n');
+      await connectHub(database,config,{url,secretEnv:await ask('Credential environment variable name: '),fetchImpl});
+    }else{
+      // Reuse the existing stdin validation, owner-only storage and auth-failure
+      // cleanup. The credential is never an argv value or a SQLite row.
+      await connectHub(database,config,{url,secretStdin:true,input:Readable.from([await askSecret('Hub credential: ')]),fetchImpl});
+    }
+  }
+  output.write('Connected to OpenCodex Hub ✓\n');
+  const selected=await attachOpenCodex(database,config,{input,output,question:ask,fetchImpl,announce:false});
+  if(!selected)return{status:'not_selected'};
+  output.write(`OpenCodex setup complete ✓\nProfile: ${selected.profileName}\nMeasurement will sync automatically.\n`);
+  return{status:'complete'};
+}
+export async function attachOpenCodex(database,config,{input=process.stdin,output=process.stdout,question,command='codex-meter-agent profile attach-opencodex',fetchImpl=fetch,announce=true}={}){
+  const {pending}=await pendingHubProfiles(database,config,fetchImpl);
   if(!pending.length){output.write('No profiles are waiting for OpenCodex selection.\n');return;}
   if(!question&&!input.isTTY){output.write(`ACTION REQUIRED:\n${command}\n`);return;}
   const reader=question?null:createInterface({input,output});const ask=question??(prompt=>reader.question(prompt));
@@ -146,7 +202,8 @@ export async function attachOpenCodex(database,config,{input=process.stdin,outpu
     const current=await meterHubRequest(config,'GET',undefined,fetchImpl);if(!current.profiles.some(p=>p.bindingId===profile.bindingId&&p.accountId===profile.accountId))problem('profile_changed');
     if(database.prepare('SELECT 1 FROM hub_selections WHERE connection_id=? AND log_label=?').get(connection.connectionId,account.logLabel))problem('account_already_selected');
     database.prepare('INSERT INTO hub_selections(binding_id,account_id,log_label,connection_id,selected_at) VALUES(?,?,?,?,?)').run(profile.bindingId,profile.accountId,account.logLabel,connection.connectionId,new Date().toISOString());
-    output.write('OpenCodex account selected. The Agent applies measurement automatically.\n');
+    if(announce)output.write('OpenCodex account selected. The Agent applies measurement automatically.\n');
+    return{profileName:safeText(profile.name)};
   }finally{reader?.close();}
 }
 export class HubAdapter {

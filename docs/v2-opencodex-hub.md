@@ -32,7 +32,40 @@ Add it to the Device representing the Hub Agent (not each client laptop).
 Source type is fixed when creating a Profile; Native Profiles are not converted.
 Only one reporter can be active for a Hub Profile.
 
-On that Agent's machine, provide the Hub Management API credential explicitly:
+After installing/enrolling a wizard-capable candidate Agent, run on its machine:
+
+```sh
+codex-meter-agent opencodex setup
+```
+
+The wizard checks enrollment and pending Hub Profiles before asking for a
+credential. With no pending Profile, add one to this Device in the dashboard;
+the wizard never creates Server Profiles. Already-configured Profiles do not
+trigger reconnect. A valid existing Hub connection is reused; an invalid one is
+not silently overwritten. Selected Profiles with missing/invalid local connection
+metadata or an unavailable credential reference report actionable recovery, not
+successful configuration. For a first connection, enter the Hub origin and:
+
+- Linux/macOS: type the credential at the **hidden** prompt. It uses the existing
+  stdin credential storage: an Agent-local owner-only 0600 file, separate from
+  config, connection metadata and SQLite. Credential-input/auth failures do not leave a new
+  credential file. Never put the credential in the command line.
+- Windows: enter the name of an explicitly configured credential environment
+  variable. The running/background Agent must receive that same variable. No new
+  plaintext credential-file storage is introduced.
+
+Choose a pending Meter Profile if there are several, then explicitly select one
+Hub account even if only one is listed. `main` still needs explicit confirmation.
+Completion shows the Meter Profile name; a running Agent picks it up on its next
+eligible heartbeat without a service restart (up to the existing polling cadence).
+If the Agent is not running, start it normally; the wizard does not install/start
+services. No terminal means no interactive setup, secret guessing or automatic
+account selection. It prints advanced/manual commands instead.
+
+### Advanced/manual connection (backward compatible)
+
+The existing commands remain available, with unchanged semantics. Provide the
+Hub Management API credential explicitly:
 
 ```sh
 codex-meter-agent opencodex connect --url https://your-hub.example --secret-file /your/private/credential-file
@@ -62,6 +95,17 @@ Native and Hub Profiles can coexist on a reporter. Hub Profiles do not create
 Native collectors, watchers, launchers or quota App Servers. An enrolled
 Hub-only reporter gets an empty applied Native configuration, preventing
 legacy/default collection fallback.
+
+### Existing connection recovery
+
+If setup reports that existing configuration needs attention, do not re-enroll
+or delete the Device. Restore the original Agent-local connection/credential
+from your private backup, or restore its explicitly named environment variable.
+No credential should be pasted into a report or sent to the Meter Server.
+If intentionally replacing a Hub connection, stop its Hub bindings in the
+dashboard and let the Agent apply the stop before using the advanced `opencodex
+connect` command. Re-add the wanted Hub Profile and run `opencodex setup` again.
+The wizard does not perform that destructive recovery automatically.
 
 ## Audited stock API contract
 
@@ -153,6 +197,9 @@ today/7d/30d/all and quota with OpenCodex's account view. Restart the Canary Age
 and verify values/selection. Check unselected labels, emails/IDs and credentials
 are absent from Meter wire/storage. Do not report secret values or user paths.
 
-Real Hub integration has not been run in this development environment. No real
-Hub endpoint or credential was inferred or scraped. Do not call this candidate
-production-validated until the real integration gate is completed.
+The owner reports real OpenCodex Canary PASS for checkpoint
+`0b0e34e63ec4cbbc81c86874cc4efa021be2efc8`. That result belongs to the pre-wizard
+checkpoint only. The wizard tree needs a new real UX delta check: enrollment →
+hidden credential input → explicit account selection → automatic usage/quota sync,
+plus connection reuse and cancellation. Do not attribute the older result to the
+new tree. This UX task does not modify existing Canary infrastructure or deploy.

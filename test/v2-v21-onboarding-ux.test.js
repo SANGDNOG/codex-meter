@@ -253,6 +253,39 @@ test('Hub account detail renders observed ranges/coverage/quota but no Native De
     document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.match(document.querySelector('main').textContent,/OpenCodex 관측 사용량/);
   });
 });
+test('Hub enrollment shows install then setup, with no advanced credential commands',async()=>{
+  const hub={id:'hub',name:'Hub Profile',measurementSource:'opencodex_proxy'};
+  const fetchImpl=async(input,init={})=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts')return jsonResponse(200,{accounts:[hub]});
+    if(route==='/api/v1/devices'&&init.method==='POST'){assert.equal(JSON.parse(init.body).mode,'opencodex');return jsonResponse(201,{enrollmentId:'hub-enrollment',enrollmentToken:'a'.repeat(32),expiresAt:'2026-09-08T12:15:00.000Z'});}
+    if(route==='/api/v1/device-enrollments/hub-enrollment')return jsonResponse(200,{status:'pending',deviceId:null});
+    return jsonResponse(404,{});
+  };
+  await domFixture({url:'https://meter.example/#/devices/add',fetchImpl},async({window,document,settle})=>{
+    const select=document.querySelector('[data-testid="initial-account"]');select.value='hub';select.dispatchEvent(new window.Event('change'));
+    document.querySelector('[data-testid="device-name"]').value='Hub reporter';document.querySelector('[data-testid="add-device-form"]').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));await settle();
+    assert.ok(document.querySelector('[data-testid="command-linux"]'));assert.equal(document.querySelector('[data-testid="hub-setup-notice"] code').textContent,'codex-meter-agent opencodex setup');
+    assert.match(document.querySelector('main').textContent,/Install\/enroll Agent, then run setup/);assert.doesNotMatch(document.querySelector('main').textContent,/--secret-file|opencodex connect|profile attach-opencodex/);
+  });
+});
+test('Pending Hub profile uses canonical setup guidance in English and Korean',async()=>{
+  const hubProfile={id:'binding-hub',accountId:'hub',name:'<script>private</script>',mode:'opencodex',trackingState:'local_selection_required',disabledAt:null};
+  const device={id:'hub-device',name:'Reporter',profiles:[],hubProfiles:[hubProfile],state:'online',configurationStatus:'healthy',desiredRevision:0,appliedRevision:0};
+  const fetchImpl=async input=>{const route=new URL(String(input),'https://meter.example').pathname;
+    if(route==='/api/v1/auth/session')return jsonResponse(200,{csrfToken:'csrf'});
+    if(route==='/api/v1/devices/hub-device')return jsonResponse(200,device);
+    if(route==='/api/v1/usage/devices/hub-device')return jsonResponse(200,emptyUsage());
+    if(route==='/api/v1/groups')return jsonResponse(200,{groups:[]});
+    if(route==='/api/v1/accounts')return jsonResponse(200,{accounts:[]});return jsonResponse(404,{});
+  };
+  await domFixture({url:'https://meter.example/#/devices/hub-device',fetchImpl},async({document,settle})=>{
+    assert.match(document.querySelector('[data-testid="profile-hub"]').textContent,/codex-meter-agent opencodex setup/);assert.equal(document.querySelector('main script'),null);
+    assert.doesNotMatch(document.querySelector('main').textContent,/opencodex connect|attach-opencodex|secret-file/);
+    document.querySelector('[data-testid="language-toggle"]').click();await settle();assert.match(document.querySelector('[data-testid="hub-setup-notice"]').textContent,/설치·등록/);
+  });
+});
 function emptyUsage(){return{measured:{...ZERO},adjusted:{totalTokens:'0'},combined:{totalTokens:'0'}};}
 function unavailableQuota(){return{observedAt:null,status:'unavailable',reporterState:'no_reporter',reporterDeviceId:null,errorKind:null,planType:null,windows:[]};}
 function emptyAttribution(accountId){return{accountId,quota:unavailableQuota(),windows:[],warnings:[]};}
