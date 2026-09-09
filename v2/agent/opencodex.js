@@ -82,13 +82,20 @@ export function parseHubUsage(data,range,label,clock=Date.now){
   // No row means no explicitly labelled ledger attempts, NOT proof of complete coverage.
   return validateHubUsage({range,observedAt:new Date(data.generatedAt).toISOString(),since:data.since===null?null:new Date(data.since).toISOString(),status:'available',tokens,counts,coverage:row?row.usageCoverageRatio:0});
 }
+function quotaResetIso(reset){
+  if(reset==null||reset===0)return null;
+  if(!Number.isSafeInteger(reset)||reset<0)problem('malformed');
+  const date=new Date(reset>10_000_000_000?reset:reset*1000);
+  if(!Number.isFinite(date.getTime()))problem('malformed');
+  return date.toISOString();
+}
 export function parseHubQuota(account,clock=Date.now){
   const unavailable=()=>({observedAt:new Date(clock()).toISOString(),status:'unavailable',windows:[]});
   const quota=account.quota;if(!quota||account.needsReauth)return unavailable();
   if(account.quotaRefresh&&account.quotaRefresh.status!=='ok')return unavailable();
   if(!Number.isSafeInteger(quota.updatedAt)||quota.updatedAt<0||quota.updatedAt>clock()+300000)problem('malformed');
   const windows=[];
-  const append=(limitId,percent,reset,duration)=>{if(percent==null)return;windows.push({limitId,usedPercent:percent,durationMinutes:duration,resetsAt:reset==null?null:Number.isSafeInteger(reset)&&reset>=0?new Date(reset).toISOString():problem('malformed')});};
+  const append=(limitId,percent,reset,duration)=>{if(percent==null)return;windows.push({limitId,usedPercent:percent,durationMinutes:duration,resetsAt:quotaResetIso(reset)});};
   append('weekly',quota.weeklyPercent,quota.weeklyResetAt,10080);
   append('monthly',quota.monthlyPercent,quota.monthlyResetAt,43200);
   const short=quota.shortWindowSeconds;
